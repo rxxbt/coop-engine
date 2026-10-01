@@ -1,0 +1,19 @@
+{
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "dataDir": "data",
+  "slippageBps": 100,
+  "tokens": [
+    {
+      "mint": "FILL_ME_token_mint",
+      "symbol": "EXDEV",
+      "quoteMint": "So11111111111111111111111111111111111111112",
+      "decimals": 6,
+      "exclusions": ["FILL_ME_treasury_wallet"],
+      "epochHours": 6,
+      "sinks": [
+        { "type": "reflections", "share": 0.9, "payoutMint": "So11111111111111111111111111111111111111112", "rule": { "type": "pro-rata" }, "minAmount": "100000000", "distribution": "push" },
+        { "type": "treasury", "share": 0.1, "wallet": "FILL_ME_treasury_wallet" }
+      ]
+    }
+  ]
+}

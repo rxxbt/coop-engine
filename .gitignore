@@ -1,0 +1,12 @@
+node_modules/
+data/
+registry/
+store/
+.env
+api.env
+telegram.env
+engine.config.json
+communities.json
+keys/
+*.log
+.DS_Store

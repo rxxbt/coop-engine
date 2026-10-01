@@ -1,0 +1,22 @@
+# Example systemd unit for the engine's API. Adjust the paths; the API needs no access to the operator key.
+[Unit]
+Description=COOP engine API (metadata hosting, token registry, ledgers)
+After=network.target
+
+[Service]
+Type=simple
+User=coop
+Group=coop
+WorkingDirectory=/opt/coop/engine
+EnvironmentFile=/opt/coop/engine/api.env
+ExecStart=/usr/bin/node node_modules/tsx/dist/cli.mjs src/api.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/coop/engine/data /opt/coop/engine/registry /opt/coop/engine/store
+
+[Install]
+WantedBy=multi-user.target

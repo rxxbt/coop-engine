@@ -1,0 +1,30 @@
+{
+  "name": "coop-engine",
+  "version": "1.0.0",
+  "description": "COOP payout engine: turns a token's transfer tax into payouts under published rules, and publishes a ledger of every epoch.",
+  "main": "index.js",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "api": "tsx src/api.ts",
+    "epoch-all": "tsx src/cli.ts epoch --all",
+    "tokens": "tsx src/cli.ts tokens"
+  },
+  "keywords": [],
+  "author": "COOP",
+  "license": "UNLICENSED",
+  "type": "module",
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "@types/node": "^26.6.2",
+    "bn.js": "^5.2.5",
+    "dotenv": "^18.0.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "@raydium-io/raydium-sdk-v2": "^0.2.73-alpha",
+    "tweetnacl": "^1.0.3",
+    "bs58": "^6.0.0"
+  },
+  "private": true
+}
