@@ -433,6 +433,8 @@ http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   if (origin && ORIGINS.includes(origin)) { res.setHeader("access-control-allow-origin", origin); res.setHeader("vary", "origin"); res.setHeader("access-control-allow-headers", "content-type, solana-client"); res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS"); }
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
+  // uptime monitors and link checkers ask with HEAD: answer it like GET (Node sends the headers and drops the body)
+  if (req.method === "HEAD") req.method = "GET";
   try { await route(req, res); }
   catch (e: any) {
     const status = e instanceof HttpError ? e.status : 500;
