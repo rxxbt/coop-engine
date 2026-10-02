@@ -66,9 +66,17 @@ export function formPots(available: bigint, shares: number[], kept: bigint[]): {
  *  and roll into the next epoch. */
 export class NoRouteError extends Error {}
 
+/** The pot is worth less than a swap needs (since 2026-10-02; the floor is MIN_SWAP_LAMPORTS in src/epoch.ts). Kept like a pot with no route,
+ *  so it stays with its sinks and joins the next epoch's pot until it is worth a swap, but it is dust, not a missing market: no alert. */
+export class TooSmallError extends NoRouteError {
+  readonly lamports: bigint; readonly floor: bigint;
+  constructor(lamports: bigint, floor: bigint) { super(`worth ${lamports} lamports, under the ${floor} a swap needs`); this.lamports = lamports; this.floor = floor; }
+}
+
 /** What a conversion persists, so a crashed run resumes at the swap it died on. `path` = one direct Jupiter swap, or two swaps through SOL
- *  when Jupiter finds no direct route; decided once per epoch. `noRoute` = not even through SOL. */
-export type ConversionProgress = { swapSig?: string; converted?: string; path?: "direct" | "via-sol"; via?: { swapSig?: string; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean };
+ *  when Jupiter finds no direct route; decided once per epoch. `noRoute` = not converted this epoch: no route even through SOL, or, with
+ *  `tooSmall` (what the pot was worth, in lamports), too small to swap. */
+export type ConversionProgress = { swapSig?: string; converted?: string; path?: "direct" | "via-sol"; via?: { swapSig?: string; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean; tooSmall?: string };
 /** One swap per payout asset per epoch: `sinks` = the sinks that pay in `mint` and share the swap, `amount` = their pots together, in the
  *  token's base units. */
 export type ConversionState = ConversionProgress & { mint: string; sinks: number[]; amount: string };
@@ -111,7 +119,9 @@ export async function runConversions(r: ConversionRun): Promise<Map<number, bigi
       try { out = await r.convert(BigInt(c.amount), c.mint, c); }
       catch (e) {
         if (!(e instanceof NoRouteError)) throw e;
-        r.log(`  Jupiter has no route for ${c.amount} ${token.symbol} → ${c.mint.slice(0, 6)}…; kept for the next epoch`);
+        // the wording matters: scripts/run-epochs.sh alerts on "has no route for <amount>", and a pot too small to swap is no alert
+        if (e instanceof TooSmallError) { r.log(`  ${c.amount} ${token.symbol} → ${c.mint.slice(0, 6)}… is too small to swap (${e.message}); kept for the next epoch`); c.tooSmall = e.lamports.toString(); }
+        else r.log(`  Jupiter has no route for ${c.amount} ${token.symbol} → ${c.mint.slice(0, 6)}…; kept for the next epoch`);
         c.noRoute = true; r.save();
       }
     }

@@ -83,7 +83,7 @@ test("splitting one swap between sinks gives each sink what its own swap of the 
 });
 
 // ---- the conversion stage of an epoch, with a swap that is counted instead of sent ----
-import { runConversions, NoRouteError, type ConversionProgress, type ConversionState } from "../src/plan.js";
+import { runConversions, NoRouteError, TooSmallError, type ConversionProgress, type ConversionState } from "../src/plan.js";
 
 type St = { sinks: { done: boolean; pot: string; converted?: string; swapSig?: string; path?: string; via?: unknown; sigs: string[] }[]; conversions?: ConversionState[] };
 const SEVEN: Sink[] = [
@@ -94,11 +94,12 @@ const SEVEN: Sink[] = [
 const fresh = (sinks: Sink[], available: bigint): St => ({ sinks: potsOf(sinks, available).map((p) => ({ done: false, pot: p.toString(), sigs: [] })) });
 /** A stand-in for the engine's convert(): 1,000 token units buy 1 unit of any asset. Like the real one it records what arrived and
  *  answers from that record when asked again, so `swaps` counts only swaps that were really sent. */
-function swapper(opts: { noRoute?: string[]; failOn?: string } = {}) {
+function swapper(opts: { noRoute?: string[]; failOn?: string; tooSmall?: string[] } = {}) {
   const sent: { amount: bigint; outMint: string }[] = [];
   const convert = async (amount: bigint, outMint: string, p: ConversionProgress) => {
     if (p.converted) return BigInt(p.converted);
     if (opts.noRoute?.includes(outMint)) throw new NoRouteError("NO_ROUTES_FOUND");
+    if (opts.tooSmall?.includes(outMint)) throw new TooSmallError(342_385n, 2_000_000n);
     if (opts.failOn === outMint) throw new Error("rpc timeout");
     sent.push({ amount, outMint });
     p.swapSig = `sig${sent.length}`; p.sigs.push(p.swapSig); p.converted = (amount / 1000n).toString();
@@ -106,9 +107,9 @@ function swapper(opts: { noRoute?: string[]; failOn?: string } = {}) {
   };
   return { sent, convert };
 }
-const run = (tk: { mint: string; quoteMint: string; sinks: Sink[] }, state: St, s: ReturnType<typeof swapper>, skip = new Set<number>(), dryRun = false) => {
+const run = (tk: { mint: string; quoteMint: string; sinks: Sink[] }, state: St, s: ReturnType<typeof swapper>, skip = new Set<number>(), dryRun = false, lines: string[] = []) => {
   let saves = 0;
-  return runConversions({ token: { ...tk, symbol: "T" }, state, skip, convert: s.convert, save: () => { saves++; }, log: () => {}, dryRun }).then((parts) => ({ parts, saves }));
+  return runConversions({ token: { ...tk, symbol: "T" }, state, skip, convert: s.convert, save: () => { saves++; }, log: (l) => { lines.push(l); }, dryRun }).then((parts) => ({ parts, saves }));
 };
 
 test("epoch: seven sinks, six of them paying in SOL, send ONE swap and share what it delivered to the unit", async () => {
@@ -164,6 +165,33 @@ test("epoch: no route keeps the pots of every sink in that asset, pays the other
   assert.equal(state.conversions![1].noRoute, true);
   const again = await run(token(sinks), JSON.parse(JSON.stringify(state)), swapper());   // a route exists now, but this epoch already decided
   assert.deepEqual([...again.parts.entries()], [[0, 500n], [1, null], [2, null]]);
+});
+
+test("epoch: a pot too small to swap keeps the pots of every sink in that asset, records its worth, and is not worded as a missing route", async () => {
+  const sinks: Sink[] = [{ type: "creator", share: 0.5, wallet: W }, { type: "treasury", share: 0.3, wallet: W, asset: COOP }, { type: "burn", share: 0.2, asset: COOP }];
+  const state = fresh(sinks, 1_000_000n), s = swapper({ tooSmall: [COOP] }), lines: string[] = [];
+  const { parts } = await run(token(sinks), state, s, new Set(), false, lines);
+  assert.deepEqual([...parts.entries()], [[0, 500n], [1, null], [2, null]]);   // the SOL swap goes ahead, the COOP pots wait
+  assert.equal(s.sent.length, 1);
+  assert.equal(state.conversions![1].noRoute, true);
+  assert.equal(state.conversions![1].tooSmall, "342385");
+  assert.equal(state.conversions![0].tooSmall, undefined);
+  // scripts/run-epochs.sh alerts on "has no route for <amount>": dust must never match it
+  assert.equal(lines.some((l) => /has no route for [0-9]+ /.test(l)), false);
+  assert.ok(lines.some((l) => /500000 T → DSZSng… is too small to swap \(worth 342385 lamports, under the 2000000 a swap needs\); kept for the next epoch/.test(l)));
+  const again = await run(token(sinks), JSON.parse(JSON.stringify(state)), swapper());   // worth a swap now, but this epoch already decided
+  assert.deepEqual([...again.parts.entries()], [[0, 500n], [1, null], [2, null]]);
+});
+
+test("pots: what was too small to swap stays with its sink and is swapped once the pots have added up", async () => {
+  const sinks: Sink[] = [{ type: "creator", share: 0.5, wallet: W, asset: COOP }, refl(0.5, SOL)];
+  const first = fresh(sinks, 1_000_000n);
+  await run(token(sinks), first, swapper({ tooSmall: [COOP] }));
+  // the epoch's record keeps the creator's pot (src/epoch.ts writes kept: pot); the next epoch brings it along on top of its share
+  const kept = keptBySink({ sinks: [{ kept: first.sinks[0].pot }, {}] }, 2);
+  const pots = formPots(1_000_000n + kept[0], [0.5, 0.5], kept);
+  assert.deepEqual(pots.map((p) => p.pot), [1_000_000n, 500_000n]);
+  assert.deepEqual(pots.map((p) => p.keptIn), [500_000n, 0n]);
 });
 
 test("epoch: an epoch the older engine began, with swap progress on its sinks, gets no plan and no shared swap", async () => {

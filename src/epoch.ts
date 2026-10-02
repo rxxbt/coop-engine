@@ -16,7 +16,7 @@ import { sinkPayoutMint, type EngineConfig, type TokenConfig, type Sink } from "
 import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { withheldOf, harvestInstructions, mintWithheld, withdrawFromMintInstruction } from "./sweep.js";
 import { allocate, type Holder } from "./rules.js";
-import { NoRouteError, formPots, keptBySink, runConversions, shareOf, type ConversionProgress, type ConversionState } from "./plan.js";
+import { NoRouteError, TooSmallError, formPots, keptBySink, runConversions, shareOf, type ConversionProgress, type ConversionState } from "./plan.js";
 import { balanceTree, toHex } from "./merkle.js";
 import { quote, swapTransaction } from "./jupiter.js";
 import { LAUNCHPAD_PROGRAM, LaunchpadPool, getPdaLaunchpadPoolId } from "@raydium-io/raydium-sdk-v2";
@@ -27,6 +27,12 @@ const CPMM_AUTH = "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const ATA_RENT = 2_039_280n;
 const RENT_MIN = 890_880n; // lamports a system account must hold; a transfer that leaves less is rejected
+/** A pot worth less than this is not swapped: it stays with its sinks and joins the next epoch's pot until it is worth a swap (since
+ *  2026-10-02). Every swap costs the operator a network fee and a priority fee, and a route through a token the operator has no account
+ *  for opens one (0.0015 SOL, refundable), which a dust pot cannot cover: on 2026-10-01 a pot worth 0.00034 SOL delivered nothing. */
+const MIN_SWAP_LAMPORTS = BigInt(process.env.MIN_SWAP_LAMPORTS ?? "2000000"); // 0.002 SOL
+/** Why a sink's pot was kept for the next epoch instead of paid; published with the sink's record. */
+type KeptWhy = "no route" | "too small" | "no eligible holder";
 
 type Carry = Record<string, string>; // owner → lamports owed but too small to deliver yet
 function loadCarry(dir: string): Carry { try { return JSON.parse(fs.readFileSync(path.join(dir, "carry.json"), "utf8")); } catch { return {}; } }
@@ -50,6 +56,12 @@ async function payoutValueInLamports(mint: string, decimals: number, log: (s: st
     if (!p[mint] || !p[SOL]) return null;
     return { lamportsPerUnit: (p[mint] / 10 ** decimals) / (p[SOL] / 1e9), solUsd: p[SOL] };
   } catch (e) { log(`  payout price unavailable: ${String((e as any)?.message ?? e).slice(0, 80)}`); return null; }
+}
+/** What `amount` base units of `mint` are worth in lamports at Jupiter's price; null when the feed has no price for it right now. */
+async function lamportsOf(conn: Connection, mint: string, amount: bigint, log: (s: string) => void): Promise<bigint | null> {
+  const { decimals } = await mintProgramAndDecimals(conn, new PublicKey(mint));
+  const v = await payoutValueInLamports(mint, decimals, log);
+  return v ? BigInt(Math.floor(Number(amount) * v.lamportsPerUnit)) : null;
 }
 /** The token's dollar price at epoch time: Jupiter's feed, else the curve's own state (virtual + real reserves) times the quote's dollar price. */
 async function tokenPriceUsd(conn: Connection, token: TokenConfig, log: (s: string) => void): Promise<number | null> {
@@ -94,7 +106,7 @@ type LegState = { swapSig?: string; converted?: string };
 /** A conversion's persisted progress, and one swap per payout asset per epoch (since 2026-09-29): see src/plan.ts. */
 type ConvProgress = ConversionProgress;
 type ConvState = ConversionState;
-type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink kept in the last epoch and brought along */ keptIn?: string; sigs: string[]; minAmount?: string; tokenPriceUsd?: number; swapSig?: string; quoteBefore?: string; converted?: string; noRoute?: boolean;
+type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink kept in the last epoch and brought along */ keptIn?: string; sigs: string[]; minAmount?: string; tokenPriceUsd?: number; swapSig?: string; quoteBefore?: string; converted?: string; noRoute?: boolean; keptWhy?: KeptWhy;
   /** Only in epochs the engine began before 2026-09-29, when every sink converted on its own: the sink's own conversion progress. */
   path?: "direct" | "via-sol"; via?: LegState & { mint: string }; allocations?: [string, string][]; paidBatches?: number; root?: string; note?: string; carriedIn?: string; remainder?: string; kept?: string; lottery?: { slot: number; blockhash: string } };
 export type { SnapshotRow } from "./ledger.js";
@@ -230,15 +242,20 @@ async function swapLeg(conn: Connection, cfg: EngineConfig, opts: RunOptions, in
 async function convert(conn: Connection, token: TokenConfig, cfg: EngineConfig, amount: bigint, outMint: string, opts: RunOptions, st: ConvProgress, save: () => void, log: (s: string) => void): Promise<bigint> {
   if (st.converted) return BigInt(st.converted);
   if (!st.path) {
-    try { await quoteOrNoRoute(token.mint, outMint, amount, cfg.slippageBps); st.path = "direct"; }
-    catch (e) {
+    let path: "direct" | "via-sol", worth: bigint | null; // what the pot would fetch, in lamports (null: Jupiter's feed has no price right now)
+    try {
+      const q = await quoteOrNoRoute(token.mint, outMint, amount, cfg.slippageBps); path = "direct";
+      worth = outMint === SOL_MINT ? BigInt(q.outAmount) : await lamportsOf(conn, outMint, BigInt(q.outAmount), log);
+    } catch (e) {
       if (!(e instanceof NoRouteError) || outMint === SOL_MINT) throw e;
       const first = await quoteOrNoRoute(token.mint, SOL_MINT, amount, cfg.slippageBps);   // NoRouteError here: the token itself cannot be sold
       await quoteOrNoRoute(SOL_MINT, outMint, BigInt(first.outAmount), cfg.slippageBps);    // NoRouteError here: the asset cannot be bought
-      st.path = "via-sol";
-      log(`  no direct route ${token.symbol} → ${outMint.slice(0, 6)}…; converting through SOL`);
+      path = "via-sol"; worth = BigInt(first.outAmount);
     }
-    save();
+    // nothing is sent yet: a pot below the floor is kept whole for the next epoch (a price the feed cannot give never blocks a swap)
+    if (worth !== null && worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS);
+    if (path === "via-sol") log(`  no direct route ${token.symbol} → ${outMint.slice(0, 6)}…; converting through SOL`);
+    st.path = path; save();
   }
   if (st.path === "direct") return swapLeg(conn, cfg, opts, token.mint, token.symbol, outMint, amount, st, st.sigs, save, log);
   st.via ??= { mint: SOL_MINT };
@@ -388,11 +405,15 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     try { return await convert(conn, token, cfg, pots[i], outMint, opts, ep.sinks[i], save, log); }
     catch (e) {
       if (!(e instanceof NoRouteError)) throw e;
-      log(`  Jupiter has no route for ${pots[i]} ${token.symbol} → ${outMint.slice(0, 6)}…; kept for the next epoch`);
+      if (e instanceof TooSmallError) { log(`  ${pots[i]} ${token.symbol} → ${outMint.slice(0, 6)}… is too small to swap (${e.message}); kept for the next epoch`); ep.sinks[i].keptWhy = "too small"; }
+      else log(`  Jupiter has no route for ${pots[i]} ${token.symbol} → ${outMint.slice(0, 6)}…; kept for the next epoch`);
       ep.sinks[i].noRoute = true; save();
       return null;
     }
   };
+  /** Why sink i got no part of a swap: its asset's swap was too small this epoch, or Jupiter had no route. */
+  const keptWhy = (i: number): KeptWhy => ep.sinks[i].keptWhy ?? (ep.conversions?.find((c) => c.sinks.includes(i))?.tooSmall !== undefined ? "too small" : "no route");
+  const keptText = (why: KeptWhy, outMint: string) => (why === "too small" ? "too small to swap yet" : `no route to ${outMint.slice(0, 6)}…`);
 
   // 6. sinks
   const records: unknown[] = [];
@@ -403,9 +424,10 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     if (st.done) {
       log(`  sink ${i} ${sink.type}: done earlier (${st.sigs.length} txs)`);
       // Record what the earlier run did, from its persisted state, so the ledger reads the same as an uninterrupted epoch.
-      if (sink.type === "reflections") records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: sink.payoutMint === "same" ? token.mint : sink.payoutMint, pot: st.kept ? "0" : st.converted ?? pot.toString(), paid: st.allocations?.length ?? 0, entries: (st.allocations ?? []).map(([owner, amount]) => ({ owner, amount })), root: st.root, kept: st.kept, keptIn: st.keptIn, resumed: true, sigs: st.sigs });
-      else if (sink.type === "burn") records.push({ type: "burn", pot, asset: sink.asset && sink.asset !== "same" ? sink.asset : undefined, converted: st.converted, kept: st.kept, resumed: true, sigs: st.sigs });
-      else { const pm = sinkPayoutMint(sink, token); records.push({ type: sink.type, wallet: sink.wallet, pot, asset: pm === token.mint ? "token" : pm === token.quoteMint ? "quote" : pm, payoutMint: pm, converted: st.converted, kept: st.kept, deferred: st.note?.startsWith("deferred") ? st.note.slice(9) : undefined, resumed: true, sigs: st.sigs }); }
+      const why = st.kept ? st.keptWhy : undefined;
+      if (sink.type === "reflections") records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: sink.payoutMint === "same" ? token.mint : sink.payoutMint, pot: st.kept ? "0" : st.converted ?? pot.toString(), paid: st.allocations?.length ?? 0, entries: (st.allocations ?? []).map(([owner, amount]) => ({ owner, amount })), root: st.root, kept: st.kept, keptWhy: why, keptIn: st.keptIn, resumed: true, sigs: st.sigs });
+      else if (sink.type === "burn") records.push({ type: "burn", pot, asset: sink.asset && sink.asset !== "same" ? sink.asset : undefined, converted: st.converted, kept: st.kept, keptWhy: why, resumed: true, sigs: st.sigs });
+      else { const pm = sinkPayoutMint(sink, token); records.push({ type: sink.type, wallet: sink.wallet, pot, asset: pm === token.mint ? "token" : pm === token.quoteMint ? "quote" : pm, payoutMint: pm, converted: st.converted, kept: st.kept, keptWhy: why, deferred: st.note?.startsWith("deferred") ? st.note.slice(9) : undefined, resumed: true, sigs: st.sigs }); }
       continue;
     }
     if (pot === 0n) { st.done = true; save(); records.push({ type: sink.type, pot: "0" }); continue; }
@@ -422,9 +444,10 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       if (burnMint === SOL_MINT) throw new Error(`sink ${i}: SOL cannot be burned; pick a token to buy and burn`);
       const bought = await partOf(i, burnMint);
       if (bought === null) {
-        log(`  burn: ${pot} ${token.symbol} kept for the next epoch (no route to ${burnMint.slice(0, 6)}…)`);
-        st.note = "no route; kept for next epoch"; st.kept = pot.toString(); st.done = true; save();
-        records.push({ type: "burn", pot: "0", asset: burnMint, kept: pot, sigs: [] }); continue;
+        const why = keptWhy(i);
+        log(`  burn: ${pot} ${token.symbol} kept for the next epoch (${keptText(why, burnMint)})`);
+        st.note = `${why}; kept for next epoch`; st.kept = pot.toString(); st.keptWhy = why; st.done = true; save();
+        records.push({ type: "burn", pot: "0", asset: burnMint, kept: pot, keptWhy: why, sigs: [] }); continue;
       }
       const bPk = new PublicKey(burnMint); const { program, decimals } = await mintProgramAndDecimals(conn, bPk);
       const ix = createBurnCheckedInstruction(getAssociatedTokenAddressSync(bPk, operatorPk, true, program), bPk, operatorPk, bought, decimals, [], program);
@@ -446,9 +469,10 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       } else {
         const out = await partOf(i, outMint);
         if (out === null) {
-          log(`  ${sink.type}: ${pot} ${token.symbol} kept for the next epoch (no route to ${outMint.slice(0, 6)}…)`);
-          st.note = "no route; kept for next epoch"; st.kept = pot.toString(); st.done = true; save();
-          records.push({ type: sink.type, wallet: sink.wallet, pot: "0", asset, payoutMint: outMint, kept: pot, sigs: [] }); continue;
+          const why = keptWhy(i);
+          log(`  ${sink.type}: ${pot} ${token.symbol} kept for the next epoch (${keptText(why, outMint)})`);
+          st.note = `${why}; kept for next epoch`; st.kept = pot.toString(); st.keptWhy = why; st.done = true; save();
+          records.push({ type: sink.type, wallet: sink.wallet, pot: "0", asset, payoutMint: outMint, kept: pot, keptWhy: why, sigs: [] }); continue;
         }
         const native = outMint === SOL_MINT;
         const ixs: TransactionInstruction[] = [];
@@ -486,8 +510,8 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     // Nobody eligible (e.g. the only holder is a sink wallet): do not convert; the tokens stay with the operator and flow into the next epoch's total.
     if (eligibleNow === 0 && !st.converted && !st.allocations && !st.swapSig) {
       log(`  reflections: no eligible holder this epoch; ${pot} ${token.symbol} kept for the next epoch`);
-      st.note = "no eligible holders; kept for next epoch"; st.kept = pot.toString(); st.done = true; save();
-      records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: payoutKey, pot: "0", paid: 0, entries: [], kept: pot, sigs: [] });
+      st.note = "no eligible holders; kept for next epoch"; st.kept = pot.toString(); st.keptWhy = "no eligible holder"; st.done = true; save();
+      records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: payoutKey, pot: "0", paid: 0, entries: [], kept: pot, keptWhy: "no eligible holder", sigs: [] });
       continue;
     }
     if (sink.payoutMint !== "same") {
@@ -495,9 +519,10 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       if (sink.payoutMint !== SOL_MINT) ({ program: payoutProgram, decimals: payoutDecimals } = await mintProgramAndDecimals(conn, payoutMint));
       const got = await partOf(i, sink.payoutMint);
       if (got === null) {
-        log(`  reflections: ${pot} ${token.symbol} kept for the next epoch (no route to ${sink.payoutMint.slice(0, 6)}…)`);
-        st.note = "no route; kept for next epoch"; st.kept = pot.toString(); st.done = true; save();
-        records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: payoutKey, pot: "0", paid: 0, entries: [], kept: pot, sigs: [] });
+        const why = keptWhy(i);
+        log(`  reflections: ${pot} ${token.symbol} kept for the next epoch (${keptText(why, sink.payoutMint)})`);
+        st.note = `${why}; kept for next epoch`; st.kept = pot.toString(); st.keptWhy = why; st.done = true; save();
+        records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: payoutKey, pot: "0", paid: 0, entries: [], kept: pot, keptWhy: why, sigs: [] });
         continue;
       }
       payoutPot = got;
@@ -602,7 +627,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     tax: taxRecord(state, withheldRows.length, available, opts.dryRun),
     sinks: records,
     // the swaps of the epoch, one per payout asset: which sinks shared it, what went in and what came out (each sink's `converted` is its part)
-    conversions: (ep.conversions ?? []).map((c) => ({ mint: c.mint, sinks: c.sinks, amount: c.amount, path: c.path, via: c.via?.converted ? { mint: c.via.mint, converted: c.via.converted } : undefined, converted: c.converted, kept: c.noRoute ? c.amount : undefined, sigs: c.sigs })),
+    conversions: (ep.conversions ?? []).map((c) => ({ mint: c.mint, sinks: c.sinks, amount: c.amount, path: c.path, via: c.via?.converted ? { mint: c.via.mint, converted: c.via.converted } : undefined, converted: c.converted, kept: c.noRoute ? c.amount : undefined, tooSmall: c.tooSmall, sigs: c.sigs })),
     signatures: [...new Set([...state.sweep.sigs, ...(ep.conversions ?? []).flatMap((c) => c.sigs), ...state.sinks.flatMap((s) => s.sigs)])],
     snapshot: state.snapshot,
   });

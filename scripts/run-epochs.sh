@@ -72,6 +72,7 @@ case "${1:-}" in
     printf '%s\n' "[TOKENA] FAILED: swap not landing after 3 attempts (last 5W9H…); the epoch resumes on the next run" \
       "  creator: Jupiter has no route for 49570797400455 TOKENA → DSZSng…; kept for the next epoch" \
       "  reflections: Jupiter has no route for 38754 TOKENB → So1111…; kept for the next epoch" \
+      "  94800000000000 TOKENC → So1111… is too small to swap (worth 1200000 lamports, under the 2000000 a swap needs); kept for the next epoch" \
       "[operator] 9dZcuWdTRjStMFNpQGDsSUZvTBkhrGZXxFvNMkjbpYKv holds 0.0312 SOL LOW BALANCE (under 0.05 SOL): top it up" \
       "[all] 2026-09-29T10:05:00.000Z ran 3, failed 1, tokens 12" > "$T"
     ALERT_DRY=1; LOW_STAMP=$(mktemp -u); checks "$T" 1; rm -f "$T"; exit 0 ;;
