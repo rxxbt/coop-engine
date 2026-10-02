@@ -14,6 +14,11 @@ import bs58 from "bs58";
 import { validateToken, type Sink, type TokenConfig } from "./config.js";
 import { mintWithheld } from "./sweep.js";
 
+/** How long a registration waits for a pool its RPC cannot see yet: 15 × 2 s. Env overrides exist for tests. At most POOL_WAITERS
+ *  registrations wait at once; past that one is refused at once, as before, and the form's own retries bring it back. */
+const POOL_WAIT_TRIES = Number(process.env.POOL_WAIT_TRIES ?? 15), POOL_WAIT_MS = Number(process.env.POOL_WAIT_MS ?? 2000), POOL_WAITERS = 8;
+let poolWaiters = 0;
+
 export type Manifest = {
   version: 1;
   mint: string; symbol: string; decimals: number; quoteMint: string; platformId: string; creator: string;
@@ -29,7 +34,7 @@ export function canonical(v: unknown): string {
   return JSON.stringify(v);
 }
 
-export type VerifyOptions = { platformIds: string[]; operator: string };
+export type VerifyOptions = { platformIds: string[]; operator: string; /** tests: how often and how far apart to look for a pool not visible yet */ poolWait?: { tries: number; ms: number } };
 
 export async function verifyManifest(conn: Connection, m: Manifest, signature: string, opts: VerifyOptions): Promise<TokenConfig> {
   if (!m || m.version !== 1) throw new Error("unsupported manifest version");
@@ -54,7 +59,15 @@ export async function verifyManifest(conn: Connection, m: Manifest, signature: s
   // 2. the pool exists, on a COOP platform account, created by the signer, for exactly this mint pair
   const mint = new PublicKey(m.mint), quote = new PublicKey(m.quoteMint);
   const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, quote).publicKey;
-  const poolInfo = await conn.getAccountInfo(poolId);
+  // The form registers the moment its own RPC confirms the launch; the node behind this one can be a few slots behind (2026-10-02:
+  // a launch was refused "no pool" 3 s after it landed and registered 5 s later). Wait for the pool before calling it missing.
+  let poolInfo = await conn.getAccountInfo(poolId);
+  if (!poolInfo && poolWaiters < POOL_WAITERS) {
+    poolWaiters++;
+    const tries = opts.poolWait?.tries ?? POOL_WAIT_TRIES, ms = opts.poolWait?.ms ?? POOL_WAIT_MS;
+    try { for (let i = 0; !poolInfo && i < tries; i++) { await new Promise((r) => setTimeout(r, ms)); poolInfo = await conn.getAccountInfo(poolId); } }
+    finally { poolWaiters--; }
+  }
   if (!poolInfo) throw new Error("no LaunchLab pool exists for this mint and quote");
   const pool: any = LaunchpadPool.decode(poolInfo.data);
   if (!pool.creator.equals(creator)) throw new Error(`the pool's creator is ${pool.creator.toBase58()}, not the signer`);

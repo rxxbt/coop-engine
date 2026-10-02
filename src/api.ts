@@ -396,7 +396,9 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
         sinks: (e.sinks as any[]).map((s) => ({ type: s.type, mode: s.mode, rule: s.rule?.type, payoutMint: s.payoutMint, wallet: s.wallet, asset: s.asset, pot: s.pot, converted: s.converted, paid: s.paid, deferred: s.deferred, entries: s.entries?.length, paidAmount: Array.isArray(s.entries) ? s.entries.reduce((a: bigint, e: any) => a + BigInt(e.amount ?? 0), 0n).toString() : undefined, root: s.root, resumed: s.resumed, patched: s.patched, kept: s.kept, keptWhy: s.keptWhy, keptIn: s.keptIn, lottery: s.lottery })) })) });
   }
   if (req.method === "POST" && parts.length === 1 && (parts[0] === "upload" || parts[0] === "register")) {
-    if (limited(`write:${ip}`, 10, 10 * 60_000)) throw new HttpError(429, "too many requests; try again in ten minutes");
+    // uploads and registrations count apart (10 each per IP per 10 minutes): a dev who retried a few launches, an upload each, must still be
+    // able to register the one that went through
+    if (limited(`${parts[0]}:${ip}`, 10, 10 * 60_000)) throw new HttpError(429, "too many requests; try again in ten minutes");
     const body = await readBody(req);
     if (parts[0] === "upload") { const r = await upload(body); log(`upload ${r.uri} (${ip})`); return json(res, 200, r); }
     const c = cfg();
