@@ -14,7 +14,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentIn
 import { Raydium, TxVersion, LAUNCHPAD_PROGRAM, LaunchpadPool, getPdaLaunchpadPoolId, CREATE_CPMM_POOL_PROGRAM } from "@raydium-io/raydium-sdk-v2";
 import bs58 from "bs58";
 import type { EngineConfig } from "./config.js";
-import { jupPrices, pollConfirm } from "./epoch.js";
+import { isStaleBlockhash, jupPrices, pollConfirm } from "./epoch.js";
 
 const SOL = "So11111111111111111111111111111111111111112";
 /** The dev's part of the 0.75% creator fee: 0.42 of the pool's 1.00%. */
@@ -136,13 +136,17 @@ export async function runFees(cfg: EngineConfig, opts: FeeRunOptions, platformId
         if (landed) { prev.done = true; save(); return prev.sig; }
         if ((await conn.getBlockHeight("confirmed")) <= prev.lastValidBlockHeight) throw new Error(`${tag} ${slot} ${prev.sig} is neither confirmed nor expired; the next run resumes here`);
       }
-      const tx = await build();
-      const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
-      let raw: Uint8Array, sig: string;
-      if (tx instanceof VersionedTransaction) { tx.message.recentBlockhash = blockhash; tx.sign([operator]); raw = tx.serialize(); sig = bs58.encode(tx.signatures[0]); }
-      else { tx.recentBlockhash = blockhash; tx.feePayer = operator.publicKey; tx.sign(operator); raw = tx.serialize(); sig = bs58.encode(tx.signature!); }
-      st[slot] = { sig, lastValidBlockHeight }; save();
-      await conn.sendRawTransaction(raw, { maxRetries: 3 });
+      let sig = "", lastValidBlockHeight = 0;
+      for (let attempt = 1; ; attempt++) {
+        const tx = await build();
+        const bh = await conn.getLatestBlockhash("confirmed"); lastValidBlockHeight = bh.lastValidBlockHeight;
+        let raw: Uint8Array;
+        if (tx instanceof VersionedTransaction) { tx.message.recentBlockhash = bh.blockhash; tx.sign([operator]); raw = tx.serialize(); sig = bs58.encode(tx.signatures[0]); }
+        else { tx.recentBlockhash = bh.blockhash; tx.feePayer = operator.publicKey; tx.sign(operator); raw = tx.serialize(); sig = bs58.encode(tx.signature!); }
+        st[slot] = { sig, lastValidBlockHeight }; save();
+        try { await conn.sendRawTransaction(raw, { maxRetries: 3 }); break; }
+        catch (e) { if (isStaleBlockhash(e) && attempt < 3) { log(`${tag} ${slot}: the RPC did not know the blockhash yet (nothing sent); sending again`); await new Promise((r) => setTimeout(r, 2000)); continue; } throw e; }
+      }
       if (!(await pollConfirm(conn, sig, lastValidBlockHeight, log))) throw new Error(`${tag} ${slot} ${sig} not confirmed in time; the next run resumes here`);
       st[slot]!.done = true; save();
       return sig;

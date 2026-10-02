@@ -144,7 +144,12 @@ export async function sendAll(conn: Connection, ixs: TransactionInstruction[], p
       const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
       const tx = new Transaction({ feePayer: signer.publicKey, blockhash, lastValidBlockHeight }).add(...ixs.slice(i, i + perTx));
       tx.sign(signer);
-      sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
+      try { sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 }); }
+      catch (e) {
+        // the node that checked the transaction did not know its blockhash yet: it was refused before being sent, so sending again is safe
+        if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the blockhash yet (nothing sent); sending again (attempt ${attempt + 1} of 3)`); await new Promise((r) => setTimeout(r, 2000)); continue; }
+        throw e;
+      }
       const ok = await pollConfirm(conn, sig, lastValidBlockHeight, log);
       if (ok) break;
       const expired = (await conn.getBlockHeight("confirmed")) > lastValidBlockHeight;
@@ -161,6 +166,9 @@ export async function sendAll(conn: Connection, ixs: TransactionInstruction[], p
 // Jupiter's two ways of saying "nothing to swap here": no route at all, and an amount too small to quote (a dust pot with no direct
 // route whose SOL leg is worth 1 lamport: the second quote answers CANNOT_COMPUTE_OTHER_AMOUNT_THRESHOLD).
 // Both mean: keep the pot, try again next epoch.
+/** "Blockhash not found" from a send's preflight: the RPC node that simulated the transaction was behind the one that gave the blockhash.
+ *  The transaction was refused before it was sent (2026-10-02: one test token's epoch failed on it, the only time since 2026-09-25). */
+export const isStaleBlockhash = (e: unknown) => /blockhash not found/i.test(String((e as any)?.message ?? e));
 export const isNoRoute = (e: unknown) => /no routes? found|NO_ROUTES_FOUND|could not find any route|CANNOT_COMPUTE_OTHER_AMOUNT_THRESHOLD|Cannot compute other amount threshold/i.test(String((e as any)?.message ?? e));
 async function quoteOrNoRoute(...args: Parameters<typeof quote>) { try { return await quote(...args); } catch (e) { if (isNoRoute(e)) throw new NoRouteError(String((e as any)?.message ?? e)); throw e; } }
 
@@ -228,7 +236,9 @@ async function swapLeg(conn: Connection, cfg: EngineConfig, opts: RunOptions, in
     const qq = attempt === 1 ? q : await quoteOrNoRoute(inMint, outMint, amount, cfg.slippageBps);
     const { vtx, lastValidBlockHeight } = await swapTransaction(qq, operatorPk.toBase58());
     vtx.sign([opts.operator!]);
-    const sig = await conn.sendTransaction(vtx, { maxRetries: 3 });
+    let sig: string;
+    try { sig = await conn.sendTransaction(vtx, { maxRetries: 3 }); }
+    catch (e) { if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the swap's blockhash yet (nothing sent); re-quoting (attempt ${attempt + 1} of 3)`); continue; } throw e; }
     leg.swapSig = sig; save();
     if (await pollConfirm(conn, sig, lastValidBlockHeight, log)) { const got = await settle(sig); log(`  swap sent ${sig}, delivered ${got}`); return got; }
     if (attempt < 3) log(`  swap ${sig.slice(0, 12)}… was not included; re-quoting (attempt ${attempt + 1} of 3)`);
