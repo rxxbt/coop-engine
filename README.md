@@ -54,6 +54,7 @@ npx tsx src/cli.ts tokens                     # every token the engine knows
 npx tsx src/cli.ts epoch <mint>               # dry run: quotes, allocations, nothing sent
 npx tsx src/cli.ts epoch <mint> --execute     # signs with the operator key
 npx tsx src/cli.ts epoch --all --execute      # the scheduler: every token whose epoch is due
+npx tsx src/cli.ts fees --all                 # dry run: graduated pools' creator fees, what would be forwarded
 npm test
 ```
 
@@ -68,6 +69,14 @@ engine sweep the tax, and it signs every payout. What that key does every epoch 
 is public. Tokens register by a message their creator signs before launch; the engine accepts a registration only when the
 pool exists on a COOP platform account, was created by the signer, and its tax can be withdrawn by the operator
 (`src/registry.ts`).
+
+## After graduation
+
+A token that completes its curve migrates into a Raydium CPMM pool whose recorded creator is the operator. Every swap there pays a
+0.75% creator fee into the pool. Once a day `scripts/run-fees.sh` claims those fees for every graduated token on a COOP platform account
+and sends the token's creator 42/75 of each claim (0.42 of the pool's 1.00%); the rest goes to the platform's fee wallet. A pool's fees
+are claimed only once the creator's share is worth at least $1; until then they keep accruing in the pool. Every claim and transfer is
+recorded per token and served with the token's ledger (`src/fees.ts`).
 
 ## Layout
 

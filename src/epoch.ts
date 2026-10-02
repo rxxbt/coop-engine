@@ -41,7 +41,7 @@ function saveCarry(dir: string, c: Carry) { fs.writeFileSync(path.join(dir, "car
 const PRICE_API = process.env.JUP_PRICE_API || "https://lite-api.jup.ag/price/v3";
 /** A first payout to a wallet with no token account must be worth at least this much (and twice the account's rent) before the operator funds the account. */
 const MIN_FIRST_PAYOUT_USD = 1;
-async function jupPrices(ids: string[]): Promise<Record<string, number>> {
+export async function jupPrices(ids: string[]): Promise<Record<string, number>> {
   const r = await fetch(`${PRICE_API}?ids=${ids.join(",")}`, { signal: AbortSignal.timeout(15_000) });
   if (!r.ok) throw new Error(`price ${r.status}`);
   const j: any = await r.json(); const out: Record<string, number> = {};
@@ -136,7 +136,7 @@ async function tokenBalance(conn: Connection, ata: PublicKey, program: PublicKey
  *  sendAndConfirmTransaction, which also opens a websocket: when the RPC answers the socket with 429 a stray rejection escapes every
  *  try/catch and ends the whole run. A batch is sent again
  *  only when its blockhash has provably expired without inclusion; a plain timeout throws, and the next run resumes from the record. */
-async function sendAll(conn: Connection, ixs: TransactionInstruction[], perTx: number, signer: Keypair, log: (s: string) => void, onSent?: (sig: string, batch: number) => void): Promise<string[]> {
+export async function sendAll(conn: Connection, ixs: TransactionInstruction[], perTx: number, signer: Keypair, log: (s: string) => void, onSent?: (sig: string, batch: number) => void): Promise<string[]> {
   const sigs: string[] = [];
   for (let i = 0, b = 0; i < ixs.length; i += perTx, b++) {
     let sig = "";
@@ -165,7 +165,7 @@ export const isNoRoute = (e: unknown) => /no routes? found|NO_ROUTES_FOUND|could
 async function quoteOrNoRoute(...args: Parameters<typeof quote>) { try { return await quote(...args); } catch (e) { if (isNoRoute(e)) throw new NoRouteError(String((e as any)?.message ?? e)); throw e; } }
 
 /** Poll for confirmation instead of waiting on a WebSocket subscription; false once the blockhash expired without inclusion (then a re-send cannot double-execute). */
-async function pollConfirm(conn: Connection, sig: string, lastValidBlockHeight: number | undefined, log: (s: string) => void): Promise<boolean> {
+export async function pollConfirm(conn: Connection, sig: string, lastValidBlockHeight: number | undefined, log: (s: string) => void): Promise<boolean> {
   const t0 = Date.now();
   while (Date.now() - t0 < 120_000) {
     const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];

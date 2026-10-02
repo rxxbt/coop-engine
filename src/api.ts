@@ -34,6 +34,15 @@ const PUBLIC_BASE = (process.env.PUBLIC_BASE || `http://127.0.0.1:${PORT}`).repl
 const SITE_BASE = (process.env.SITE_BASE || "http://127.0.0.1:5173").replace(/\/$/, "");
 const ORIGINS = (process.env.CORS_ORIGINS || "http://127.0.0.1:5173,http://localhost:5173").split(",").map((s) => s.trim());
 const STORE = process.env.STORE_DIR || "store";
+/** Pool fees forwarded since graduation (src/fees.ts writes data/<mint>/fees.json), published per token as the docs promise. */
+function poolFeesOf(dataDir: string, mint: string): { toDev: Record<string, string>; count: number; records: unknown[] } | undefined {
+  let recs: any[];
+  try { recs = JSON.parse(fs.readFileSync(path.join(dataDir, mint, "fees.json"), "utf8")); } catch { return undefined; }
+  if (!Array.isArray(recs) || !recs.length) return undefined;
+  const toDev: Record<string, string> = {};
+  for (const r of recs) toDev[r.quoteMint] = (BigInt(toDev[r.quoteMint] ?? "0") + BigInt(r.dev?.quote ?? "0")).toString();
+  return { toDev, count: recs.length, records: recs };
+}
 const PLATFORM_IDS = (process.env.PLATFORM_IDS || "DEfEVZNPRvQGCpKq19BQ5dpB2hmGVFJ4y1ewPSFz22y5,BWk6ALyW2yj1tud1v7Dr4SQzYGprA6na1xRhiv2tZoNG,Cd3DhizoqEUwMhpHiqF4wcFFocq6QCDZEHU6UvRnJY21").split(",").map((s) => s.trim());
 const OPERATOR = process.env.OPERATOR_PUBKEY || (process.env.OPERATOR_KEYPAIR && fs.existsSync(process.env.OPERATOR_KEYPAIR)
   ? new PublicKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.OPERATOR_KEYPAIR, "utf8"))).slice(32)).toBase58()
@@ -391,7 +400,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
         if (hit && hit.mint === m) assets[m] = { symbol: hit.symbol, decimals: hit.decimals };
       }
     } catch { /* names are a nicety; the page falls back to short mints */ }
-    return json(res, 200, { ...publicToken(t, c.dataDir), engine: ENGINE_ID, metadata: meta, assets, tax: fee ? { bps: fee.feeBps, withheldNow: fee.withheld.toString(), authority: fee.withdrawAuthority } : null,
+    return json(res, 200, { ...publicToken(t, c.dataDir), engine: ENGINE_ID, metadata: meta, assets, tax: fee ? { bps: fee.feeBps, withheldNow: fee.withheld.toString(), authority: fee.withdrawAuthority } : null, poolFees: poolFeesOf(c.dataDir, t.mint),
       epochs: l.epochs().map((e) => ({ epoch: e.epoch, ranAt: e.ranAt, withdrawn: e.tax.withdrawn, ...sweptOf(e), signatures: e.signatures, snapshotSlot: e.snapshot?.slot ?? null, holders: e.snapshot?.holders.length ?? null, verified: verifyEpoch(e, t).ok,
         sinks: (e.sinks as any[]).map((s) => ({ type: s.type, mode: s.mode, rule: s.rule?.type, payoutMint: s.payoutMint, wallet: s.wallet, asset: s.asset, pot: s.pot, converted: s.converted, paid: s.paid, deferred: s.deferred, entries: s.entries?.length, paidAmount: Array.isArray(s.entries) ? s.entries.reduce((a: bigint, e: any) => a + BigInt(e.amount ?? 0), 0n).toString() : undefined, root: s.root, resumed: s.resumed, patched: s.patched, kept: s.kept, keptWhy: s.keptWhy, keptIn: s.keptIn, lottery: s.lottery })) })) });
   }

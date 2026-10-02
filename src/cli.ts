@@ -7,17 +7,27 @@ import { withheldOf, mintWithheld } from "./sweep.js";
 import { runEpoch } from "./epoch.js";
 import { Ledger } from "./ledger.js";
 import { verifyEpoch } from "./verify.js";
+import { runFees } from "./fees.js";
 
 const [cmd, arg, ...rest] = process.argv.slice(2);
 const cfgPath = process.env.ENGINE_CONFIG || "engine.config.json";
 const cfg = loadConfig(cfgPath);
-const usage = "usage: tsx src/cli.ts tokens | withheld <SYMBOL|mint> | snapshot <SYMBOL|mint> | epoch <SYMBOL|mint|--all> [--execute] | verify <SYMBOL|mint> <epoch>";
+const usage = "usage: tsx src/cli.ts tokens | withheld <SYMBOL|mint> | snapshot <SYMBOL|mint> | epoch <SYMBOL|mint|--all> [--execute] | verify <SYMBOL|mint> <epoch> | fees [--all|<SYMBOL|mint>] [--execute]";
 const execute = process.argv.includes("--execute");
 const loadOperator = () => (execute ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.OPERATOR_KEYPAIR!, "utf8")))) : undefined);
 /** The operator's public key for dry runs: from OPERATOR_PUBKEY, else the public half of the keypair file, else the known COOP operator. */
 const operatorPubkey = () => new PublicKey(process.env.OPERATOR_PUBKEY || (process.env.OPERATOR_KEYPAIR && fs.existsSync(process.env.OPERATOR_KEYPAIR) ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.OPERATOR_KEYPAIR, "utf8")))).publicKey.toBase58() : "9dZcuWdTRjStMFNpQGDsSUZvTBkhrGZXxFvNMkjbpYKv"));
 const conn = new Connection(cfg.rpc, "confirmed");
 const GRACE_MS = 5 * 60_000; // cron jitter: an epoch due at 18:00:00 whose predecessor ran at 12:00:09 still counts as due
+
+if (cmd === "fees") {
+  // Once a day (scripts/run-fees.sh): claim the creator fees of graduated pools and forward the dev's share (src/fees.ts). Dry run unless --execute.
+  const platformWallet = process.env.PLATFORM_FEE_WALLET ? new PublicKey(process.env.PLATFORM_FEE_WALLET) : undefined;
+  const only = arg && !arg.startsWith("--") ? arg : undefined;
+  const r = await runFees(cfg, { dryRun: !execute, operator: loadOperator(), operatorPubkey: operatorPubkey(), platformWallet, only });
+  console.log(`[fees] ${new Date().toISOString()} forwarded ${r.forwarded.length}, waiting ${r.waiting}, failed ${r.failed.length}${r.forwarded.length ? `: ${r.forwarded.join("; ")}` : ""}`);
+  process.exit(r.failed.length ? 1 : 0);
+}
 
 if (cmd === "tokens") {
   for (const t of cfg.tokens) {
