@@ -101,24 +101,21 @@ export function allocate(rule: Rule, holders: Holder[], pot: bigint, opts: Alloc
       break;
     }
     case "lottery": {
-      // deterministic weighted draw without replacement; seed should be an epoch blockhash, published with the result
+      // `winners` equal prizes, each drawn on its own by balance weight from every eligible holder, so one wallet can win more than one:
+      // every wallet's expected share is its share of the balance, however it is split. (Until 2026-10-03 a wallet could win at most once,
+      // and with 5 prizes a holder of half the supply got about 20% of the pot as one wallet and about 45% split into five.)
+      // Deterministic: prize i is drawn with sha256(`${seed}:${i}`), the seed being a blockhash published with the result.
       const seed = opts.seed ?? "";
-      const remaining = eligible.map((h) => ({ owner: h.owner, w: h.amount }));
-      const winners: string[] = [];
-      const n = Math.min(rule.winners, remaining.length);
-      for (let i = 0; i < n; i++) {
-        const total = remaining.reduce((a, r) => a + r.w, 0n);
+      const total = eligible.reduce((a, h) => a + h.amount, 0n);
+      const each = pot / BigInt(rule.winners);
+      for (let i = 0; i < rule.winners && each > 0n; i++) {
         const digest = sha256(new TextEncoder().encode(`${seed}:${i}`));
         let r = 0n;
         for (const b of digest.subarray(0, 16)) r = (r << 8n) | BigInt(b);
-        let pick = r % total;
-        let idx = 0;
-        while (idx < remaining.length && pick >= remaining[idx].w) { pick -= remaining[idx].w; idx++; }
-        winners.push(remaining[idx].owner);
-        remaining.splice(idx, 1);
+        let pick = r % total, idx = 0;
+        while (pick >= eligible[idx].amount) { pick -= eligible[idx].amount; idx++; }
+        allocations.set(eligible[idx].owner, (allocations.get(eligible[idx].owner) ?? 0n) + each);
       }
-      const each = pot / BigInt(winners.length);
-      for (const w of winners) allocations.set(w, each);
       break;
     }
   }

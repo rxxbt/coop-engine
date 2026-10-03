@@ -14,7 +14,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentIn
 import { Raydium, TxVersion, LAUNCHPAD_PROGRAM, LaunchpadPool, getPdaLaunchpadPoolId, CREATE_CPMM_POOL_PROGRAM } from "@raydium-io/raydium-sdk-v2";
 import bs58 from "bs58";
 import type { EngineConfig } from "./config.js";
-import { isStaleBlockhash, jupPrices, pollConfirm } from "./epoch.js";
+import { isStaleBlockhash, jupPrices, landed, pollConfirm } from "./epoch.js";
 
 const SOL = "So11111111111111111111111111111111111111112";
 /** The dev's part of the 0.75% creator fee: 0.42 of the pool's 1.00%. */
@@ -131,10 +131,10 @@ export async function runFees(cfg: EngineConfig, opts: FeeRunOptions, platformId
       const prev = st[slot];
       if (prev?.done) return prev.sig;
       if (prev) {
-        let landed = false;
-        try { landed = await pollConfirm(conn, prev.sig, prev.lastValidBlockHeight, log); } catch { landed = false; } // failed on-chain: it moved nothing
-        if (landed) { prev.done = true; save(); return prev.sig; }
-        if ((await conn.getBlockHeight("confirmed")) <= prev.lastValidBlockHeight) throw new Error(`${tag} ${slot} ${prev.sig} is neither confirmed nor expired; the next run resumes here`);
+        // settled as every epoch payment is (src/epoch.ts): an RPC error stops the run instead of reading as "failed on-chain", which until
+        // 2026-10-03 could send a forwarding again that had landed
+        const sig = await landed(conn, prev, log);
+        if (sig) { prev.done = true; save(); return sig; }
       }
       let sig = "", lastValidBlockHeight = 0;
       for (let attempt = 1; ; attempt++) {

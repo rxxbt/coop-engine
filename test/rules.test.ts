@@ -41,11 +41,27 @@ test("never-sold bonus goes only to loyal wallets", () => {
   assert.equal(r.allocations.get("seller"), 250n);
 });
 
-test("lottery is deterministic for a seed and pays equal shares", () => {
+test("lottery is deterministic for a seed and pays equal prizes, more than one to the same wallet when it is drawn again", () => {
   const hs = [H("a", 100n), H("b", 900n), H("c", 50n)];
   const r1 = allocate({ type: "lottery", winners: 2 }, hs, 1000n, { seed: "blockhash-1" });
   const r2 = allocate({ type: "lottery", winners: 2 }, hs, 1000n, { seed: "blockhash-1" });
   assert.deepEqual([...r1.allocations.entries()], [...r2.allocations.entries()]);
-  assert.equal(r1.allocations.size, 2);
-  for (const v of r1.allocations.values()) assert.equal(v, 500n);
+  assert.equal(sum(r1.allocations), 1000n);
+  for (const v of r1.allocations.values()) assert.equal(v % 500n, 0n);
+  // one eligible wallet wins every prize: the whole pot
+  assert.equal(allocate({ type: "lottery", winners: 5 }, [H("solo", 10n)], 1000n, { seed: "s" }).allocations.get("solo"), 1000n);
+});
+
+test("splitting a wallet does not raise its expected lottery winnings (2026-10-03: before, half the supply won ~20% as one wallet, ~45% as five)", () => {
+  const others = Array.from({ length: 20 }, (_, i) => H(`o${i}`, 25n));
+  const share = (whale: Holder[]) => {
+    let won = 0n;
+    for (let s = 0; s < 4000; s++) {
+      const a = allocate({ type: "lottery", winners: 5 }, [...whale, ...others], 1_000_000n, { seed: `seed-${s}` }).allocations;
+      for (const h of whale) won += a.get(h.owner) ?? 0n;
+    }
+    return Number(won) / 4000 / 1_000_000;
+  };
+  const one = share([H("w", 500n)]), five = share(Array.from({ length: 5 }, (_, i) => H(`w${i}`, 100n)));
+  assert.ok(Math.abs(one - 0.5) < 0.03 && Math.abs(five - 0.5) < 0.03, `one wallet ${one}, five wallets ${five}: both should be ~0.5`);
 });

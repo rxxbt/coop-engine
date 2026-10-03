@@ -306,7 +306,7 @@ async function preview(t: TokenConfig, c: EngineConfig) {
       { label: "pro-rata", rule: { type: "pro-rata" } },
       { label: `holding-time weighted, +${aged.step.toFixed(2)}× per ${aged.intervalHours} h, cap ${aged.cap.toFixed(2)}×`, rule: aged },
       { label: "never-sold bonus", rule: { type: "never-sold-bonus", bonusShare: 1 } }, // the whole pot to never-sold wallets, as the form registers it since 2026-09-29
-      { label: "balance-weighted lottery, 5 winners", rule: { type: "lottery", winners: 5 } },
+      { label: "balance-weighted lottery, 5 prizes", rule: { type: "lottery", winners: 5 } },
     ];
     const pctOf = (a: bigint, of: bigint) => (of > 0n ? Number((a * 10000n) / of) / 100 : 0);
     return {

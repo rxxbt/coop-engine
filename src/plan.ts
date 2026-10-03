@@ -76,7 +76,7 @@ export class TooSmallError extends NoRouteError {
 /** What a conversion persists, so a crashed run resumes at the swap it died on. `path` = one direct Jupiter swap, or two swaps through SOL
  *  when Jupiter finds no direct route; decided once per epoch. `noRoute` = not converted this epoch: no route even through SOL, or, with
  *  `tooSmall` (what the pot was worth, in lamports), too small to swap. */
-export type ConversionProgress = { swapSig?: string; converted?: string; path?: "direct" | "via-sol"; via?: { swapSig?: string; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean; tooSmall?: string };
+export type ConversionProgress = { swapSig?: string; lastValidBlockHeight?: number; converted?: string; path?: "direct" | "via-sol"; via?: { swapSig?: string; lastValidBlockHeight?: number; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean; tooSmall?: string };
 /** One swap per payout asset per epoch: `sinks` = the sinks that pay in `mint` and share the swap, `amount` = their pots together, in the
  *  token's base units. */
 export type ConversionState = ConversionProgress & { mint: string; sinks: number[]; amount: string };

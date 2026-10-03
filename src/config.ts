@@ -9,7 +9,7 @@ export type Rule =
    *  start at 1×. The holding interval is independent of the payout epoch. */
   | { type: "time-weighted"; intervalHours: number; step: number; cap: number }
   | { type: "never-sold-bonus"; bonusShare: number }      // bonusShare of the pot goes only to wallets that never reduced their balance
-  | { type: "lottery"; winners: number };                 // `winners` wallets drawn by balance weight, deterministic seed
+  | { type: "lottery"; winners: number };                 // `winners` equal prizes, each drawn by balance weight (one wallet can win several), deterministic seed
 
 /**
  * Every sink can pay in any asset Jupiter routes (2026-09-28):

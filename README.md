@@ -19,7 +19,8 @@ This repository is the code the live engine runs. Every published epoch can be r
    them to the unit. No route, or an amount too small to swap, keeps the pot for the next epoch.
 5. **Pay**: holders by the sink's rule (`src/rules.ts`), a treasury or the creator by transfer, a burn by burning.
 6. **Publish** the epoch record and keep a resumable state file, so a run that stops halfway picks up where it left off
-   and nothing is paid twice (`src/ledger.ts`, `src/epoch.ts`).
+   and nothing is paid twice: every payment, burn and swap is written down with its signature before it is sent, and a
+   resumed run first asks the chain whether it landed (`src/ledger.ts`, `src/epoch.ts`).
 
 ## Sinks and rules
 
@@ -31,7 +32,7 @@ itself or any asset Jupiter routes), `treasury`, `creator` and `burn`. Each hold
 | `pro-rata` | every eligible holder, by balance |
 | `time-weighted` | every eligible holder, by balance × a multiplier that grows with holding time; selling anything resets the wallet |
 | `never-sold-bonus` | only wallets that never sold, by balance; all eligible holders in an epoch where none qualifies |
-| `lottery` | a number of wallets drawn by balance weight, seeded by a blockhash taken after the snapshot |
+| `lottery` | a number of equal prizes, each drawn by balance weight (one wallet can win more than one, so splitting a wallet gains nothing), seeded by a blockhash taken after the snapshot |
 
 The rules are pure functions over the published snapshot; the tests check, among other things, that splitting a wallet
 never increases its payout.

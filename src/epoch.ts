@@ -7,6 +7,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import bs58 from "bs58";
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction,
@@ -36,7 +37,9 @@ type KeptWhy = "no route" | "too small" | "no eligible holder";
 
 type Carry = Record<string, string>; // owner → lamports owed but too small to deliver yet
 function loadCarry(dir: string): Carry { try { return JSON.parse(fs.readFileSync(path.join(dir, "carry.json"), "utf8")); } catch { return {}; } }
-function saveCarry(dir: string, c: Carry) { fs.writeFileSync(path.join(dir, "carry.json"), JSON.stringify(c, null, 1)); }
+function saveCarry(dir: string, c: Carry) { writeAtomic(path.join(dir, "carry.json"), JSON.stringify(c, null, 1)); }
+/** Write through a temporary file and a rename, so a run that dies mid-write leaves the old file whole, never half of the new one. */
+function writeAtomic(file: string, data: string) { fs.writeFileSync(`${file}.tmp`, data); fs.renameSync(`${file}.tmp`, file); }
 /** Split native-SOL payouts into deliverable now vs deferred (recipient would end below the rent minimum). */
 const PRICE_API = process.env.JUP_PRICE_API || "https://lite-api.jup.ag/price/v3";
 /** A first payout to a wallet with no token account must be worth at least this much (and twice the account's rent) before the operator funds the account. */
@@ -101,14 +104,20 @@ async function deliverable(conn: Connection, items: [string, bigint][]): Promise
 
 export type RunOptions = { dryRun: boolean; operator?: Keypair; operatorPubkey?: PublicKey; seed?: string; log?: (s: string) => void };
 
-/** One Jupiter swap's persisted progress: the signature is written before sending, the delivered amount after confirmation. */
-type LegState = { swapSig?: string; converted?: string };
+/** One Jupiter swap's persisted progress: the signature and its expiry are written before sending, the delivered amount after confirmation. */
+type LegState = { swapSig?: string; lastValidBlockHeight?: number; converted?: string };
 /** A conversion's persisted progress, and one swap per payout asset per epoch (since 2026-09-29): see src/plan.ts. */
 type ConvProgress = ConversionProgress;
 type ConvState = ConversionState;
 type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink kept in the last epoch and brought along */ keptIn?: string; sigs: string[]; minAmount?: string; tokenPriceUsd?: number; swapSig?: string; quoteBefore?: string; converted?: string; noRoute?: boolean; keptWhy?: KeptWhy;
   /** Only in epochs the engine began before 2026-09-29, when every sink converted on its own: the sink's own conversion progress. */
-  path?: "direct" | "via-sol"; via?: LegState & { mint: string }; allocations?: [string, string][]; paidBatches?: number; root?: string; note?: string; carriedIn?: string; remainder?: string; kept?: string; lottery?: { slot: number; blockhash: string } };
+  path?: "direct" | "via-sol"; via?: LegState & { mint: string }; allocations?: [string, string][]; paidBatches?: number; root?: string; note?: string; carriedIn?: string; remainder?: string; kept?: string; lottery?: { slot: number; blockhash: string };
+  /** The sink's payment in flight (for a holder sink: batch number `paidBatches`), persisted before it is sent and cleared in the same save
+   *  that records it as paid: a resumed run settles it before building anything (since 2026-10-03). */
+  pending?: Sent;
+  /** A holder sink's final pay list (after first-payout deferrals and their redistribution), frozen before the first batch is sent, with
+   *  what it took from and gave back to the carry file; `carryDone` once the carry file has it. */
+  payList?: [string, string][]; redistributed?: string; rolled?: string; consumed?: string[]; newAtas?: number; carryDone?: boolean };
 export type { SnapshotRow } from "./ledger.js";
 type EpochState = { epoch: number; mint: string; startedAt: string; sweep: { done: boolean; sigs: string[]; withheldBefore: string; available?: string; heldBefore?: string; swept?: string }; sinks: SinkState[]; conversions?: ConvState[]; finished?: boolean; snapshot?: { slot: number; at?: string; holders: SnapshotRow[] } };
 /** A blockhash produced at least `minAhead` slots after the snapshot: unknown when the snapshot was taken, public afterwards, so a lottery seeded by it is unpredictable and verifiable. */
@@ -132,33 +141,84 @@ async function tokenBalance(conn: Connection, ata: PublicKey, program: PublicKey
   if (!info) return 0n;
   return unpackAccount(ata, info, program).amount;
 }
-/** Send instructions in batches and wait for each batch by polling getSignatureStatuses (HTTP only). Until 2026-10-01 this used web3.js's
- *  sendAndConfirmTransaction, which also opens a websocket: when the RPC answers the socket with 429 a stray rejection escapes every
- *  try/catch and ends the whole run. A batch is sent again
- *  only when its blockhash has provably expired without inclusion; a plain timeout throws, and the next run resumes from the record. */
-export async function sendAll(conn: Connection, ixs: TransactionInstruction[], perTx: number, signer: Keypair, log: (s: string) => void, onSent?: (sig: string, batch: number) => void): Promise<string[]> {
-  const sigs: string[] = [];
-  for (let i = 0, b = 0; i < ixs.length; i += perTx, b++) {
-    let sig = "";
-    for (let attempt = 1; ; attempt++) {
-      const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
-      const tx = new Transaction({ feePayer: signer.publicKey, blockhash, lastValidBlockHeight }).add(...ixs.slice(i, i + perTx));
-      tx.sign(signer);
-      try { sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 }); }
-      catch (e) {
-        // the node that checked the transaction did not know its blockhash yet: it was refused before being sent, so sending again is safe
-        if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the blockhash yet (nothing sent); sending again (attempt ${attempt + 1} of 3)`); await new Promise((r) => setTimeout(r, 2000)); continue; }
-        throw e;
-      }
-      const ok = await pollConfirm(conn, sig, lastValidBlockHeight, log);
-      if (ok) break;
-      const expired = (await conn.getBlockHeight("confirmed")) > lastValidBlockHeight;
-      if (!expired) throw new Error(`transaction ${sig} not confirmed in time; the epoch resumes on the next run`);
-      if (attempt >= 3) throw new Error(`transaction not landing after 3 attempts (last ${sig}); the epoch resumes on the next run`);
-      log(`  ${sig.slice(0, 12)}… expired without inclusion; sending again (attempt ${attempt + 1} of 3)`);
+/** A transaction the engine signed: its signature and the block height its blockhash is valid to. Every payment's is persisted BEFORE it
+ *  is sent (since 2026-10-03; until then only after it confirmed, so a run that died in between could have sent the same payment again on
+ *  its next run: it never happened, every operator transaction since 2026-09-24 is in a record). */
+export type Sent = { sig: string; lastValidBlockHeight: number };
+/** Blocks past a blockhash's expiry before "not found" counts as "never landed": the node answering the status may lag the one that
+ *  gave the block height. */
+const EXPIRY_MARGIN = 30;
+/** How long the engine waits on the chain: between two status polls, for one transaction at most, after a refused send. Tests shorten it. */
+export const timing = { pollMs: 1500, waitMs: 120_000, staleMs: 2000 };
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** What became of a sent transaction: "landed"; "failed" (an on-chain error: it moved nothing); "expired" (its blockhash expired, past the
+ *  margin, and the chain has no such transaction: it can never land); null while it is still neither after `waitMs`. An RPC error is
+ *  thrown, never read as an answer. Needs an RPC that keeps transaction history (the engine's does: older statuses come back "finalized"). */
+export async function fate(conn: Connection, s: Sent, waitMs = timing.waitMs): Promise<"landed" | "failed" | "expired" | null> {
+  const status = async () => (await conn.getSignatureStatuses([s.sig], { searchTransactionHistory: true })).value[0];
+  const t0 = Date.now();
+  for (;;) {
+    const st = await status();
+    if (st?.err) return "failed";
+    if (st?.confirmationStatus === "confirmed" || st?.confirmationStatus === "finalized") return "landed";
+    if ((await conn.getBlockHeight("confirmed")) > s.lastValidBlockHeight + EXPIRY_MARGIN) {
+      // past the margin: one more look at the status, and at the transaction itself, before calling it gone
+      const again = await status();
+      if (again?.err) return "failed";
+      if (again?.confirmationStatus === "confirmed" || again?.confirmationStatus === "finalized") return "landed";
+      if (again) return null; // only "processed": on a fork that may or may not confirm
+      const tx = await conn.getTransaction(s.sig, { maxSupportedTransactionVersion: 1, commitment: "confirmed" });
+      return tx ? (tx.meta?.err ? "failed" : "landed") : "expired";
     }
-    sigs.push(sig); log(`  sent ${sig}`); onSent?.(sig, b);
+    if (Date.now() - t0 >= waitMs) return null;
+    await sleep(timing.pollMs);
   }
+}
+
+/** A payment an earlier attempt or an earlier run sent: its signature if it landed (the payment is made, nothing is sent again); undefined
+ *  when it can be forgotten (failed on-chain or expired without landing: nothing moved, build it afresh). Throws while it is neither: the
+ *  next run settles it again. */
+export async function landed(conn: Connection, s: Sent | undefined, log: (s: string) => void): Promise<string | undefined> {
+  if (!s) return undefined;
+  const f = await fate(conn, s);
+  if (f === "landed") { log(`  resume: ${s.sig} landed earlier; not sent again`); return s.sig; }
+  if (f === null) throw new Error(`transaction ${s.sig} is neither confirmed nor expired; the epoch resumes on the next run`);
+  log(`  resume: ${s.sig.slice(0, 12)}… ${f === "failed" ? "failed on-chain (it moved nothing)" : "expired without landing"}; building it again`);
+  return undefined;
+}
+
+/** Send `ixs` as ONE transaction, exactly once: sign it with a fresh blockhash, hand it to `keep` (which persists it) BEFORE sending, then
+ *  send and wait by polling (HTTP only: web3.js's sendAndConfirmTransaction opens a websocket whose 429 escaped every try/catch until
+ *  2026-10-01). Sent again only when the last attempt provably cannot land; any other outcome throws with the attempt still persisted, so
+ *  the next run settles it with `landed` before building anything. */
+export async function sendOnce(conn: Connection, ixs: TransactionInstruction[], signer: Keypair, keep: (s: Sent) => void, log: (s: string) => void): Promise<string> {
+  for (let attempt = 1; ; attempt++) {
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+    const tx = new Transaction({ feePayer: signer.publicKey, blockhash, lastValidBlockHeight }).add(...ixs);
+    tx.sign(signer);
+    const s: Sent = { sig: bs58.encode(tx.signature!), lastValidBlockHeight };
+    keep(s);
+    try { await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 }); }
+    catch (e) {
+      // the node that checked the transaction did not know its blockhash yet: it was refused before being sent, so sending again is safe
+      if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the blockhash yet (nothing sent); sending again (attempt ${attempt + 1} of 3)`); await sleep(timing.staleMs); continue; }
+      throw e;
+    }
+    if (await pollConfirm(conn, s.sig, lastValidBlockHeight, log)) return s.sig; // throws when it failed on-chain
+    const f = await fate(conn, s);
+    if (f === "landed") return s.sig;
+    if (f === "failed") throw new Error(`transaction failed on-chain (tx ${s.sig})`);
+    if (f === null) throw new Error(`transaction ${s.sig} not confirmed in time; the epoch resumes on the next run`);
+    if (attempt >= 3) throw new Error(`transaction not landing after 3 attempts (last ${s.sig}); the epoch resumes on the next run`);
+    log(`  ${s.sig.slice(0, 12)}… expired without inclusion; sending again (attempt ${attempt + 1} of 3)`);
+  }
+}
+
+/** Send instructions in batches, each exactly once within this run (the sweep: withdrawing withheld tax twice moves nothing twice). */
+export async function sendAll(conn: Connection, ixs: TransactionInstruction[], perTx: number, signer: Keypair, log: (s: string) => void): Promise<string[]> {
+  const sigs: string[] = [];
+  for (let i = 0; i < ixs.length; i += perTx) { const sig = await sendOnce(conn, ixs.slice(i, i + perTx), signer, () => {}, log); sigs.push(sig); log(`  sent ${sig}`); }
   return sigs;
 }
 // NoRouteError (src/plan.ts): Jupiter has no route (dust, or a payout mint with no market yet). Not a failure: the pot stays with the operator
@@ -175,18 +235,14 @@ async function quoteOrNoRoute(...args: Parameters<typeof quote>) { try { return 
 /** Poll for confirmation instead of waiting on a WebSocket subscription; false once the blockhash expired without inclusion (then a re-send cannot double-execute). */
 export async function pollConfirm(conn: Connection, sig: string, lastValidBlockHeight: number | undefined, log: (s: string) => void): Promise<boolean> {
   const t0 = Date.now();
-  while (Date.now() - t0 < 120_000) {
+  while (Date.now() - t0 < timing.waitMs) {
     const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
     if (st?.err) throw new Error(`transaction failed on-chain: ${JSON.stringify(st.err)} (tx ${sig})`);
     if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) return true;
     if (lastValidBlockHeight && (await conn.getBlockHeight("confirmed")) > lastValidBlockHeight) { log(`  ${sig.slice(0, 12)}…: blockhash expired without inclusion`); return false; }
-    await new Promise((r) => setTimeout(r, 1500));
+    await sleep(timing.pollMs);
   }
   return false;
-}
-async function confirmed(conn: Connection, sig: string): Promise<boolean> {
-  const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
-  return !!st && !st.err && !!st.confirmationStatus;
 }
 
 /** What a confirmed swap delivered to the operator, read from the transaction itself: exact, net of the output asset's own transfer tax, and
@@ -225,9 +281,10 @@ async function swapLeg(conn: Connection, cfg: EngineConfig, opts: RunOptions, in
     leg.converted = got.toString(); if (!sigs.includes(sig)) sigs.push(sig); save();
     return got;
   };
-  if (leg.swapSig) {
-    if (await confirmed(conn, leg.swapSig)) { const got = await settle(leg.swapSig); log(`  resume: swap ${leg.swapSig} confirmed earlier, delivered ${got}`); return got; }
-    log(`  resume: earlier swap ${leg.swapSig} not confirmed, swapping again`);
+  if (leg.swapSig && !opts.dryRun) {
+    // a swap an earlier run sent is settled first (one from before 2026-10-03 has no recorded expiry: hours old, it counts as expired)
+    const prev = await landed(conn, { sig: leg.swapSig, lastValidBlockHeight: leg.lastValidBlockHeight ?? 0 }, log);
+    if (prev) { const got = await settle(prev); log(`  resume: swap ${prev} delivered ${got}`); return got; }
   }
   const q = await quoteOrNoRoute(inMint, outMint, amount, cfg.slippageBps);
   log(`  swap ${amount} ${inLabel} → ${q.outAmount} of ${outMint.slice(0, 6)}… (impact ${q.priceImpactPct}%)`);
@@ -236,12 +293,17 @@ async function swapLeg(conn: Connection, cfg: EngineConfig, opts: RunOptions, in
     const qq = attempt === 1 ? q : await quoteOrNoRoute(inMint, outMint, amount, cfg.slippageBps);
     const { vtx, lastValidBlockHeight } = await swapTransaction(qq, operatorPk.toBase58());
     vtx.sign([opts.operator!]);
-    let sig: string;
-    try { sig = await conn.sendTransaction(vtx, { maxRetries: 3 }); }
+    // persisted before sending, like every payment; Jupiter's blockhash is at most a few blocks old, so +300 is a safe stand-in for its expiry
+    const s: Sent = { sig: bs58.encode(vtx.signatures[0]), lastValidBlockHeight: lastValidBlockHeight ?? (await conn.getBlockHeight("confirmed")) + 300 };
+    leg.swapSig = s.sig; leg.lastValidBlockHeight = s.lastValidBlockHeight; save();
+    try { await conn.sendTransaction(vtx, { maxRetries: 3 }); }
     catch (e) { if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the swap's blockhash yet (nothing sent); re-quoting (attempt ${attempt + 1} of 3)`); continue; } throw e; }
-    leg.swapSig = sig; save();
-    if (await pollConfirm(conn, sig, lastValidBlockHeight, log)) { const got = await settle(sig); log(`  swap sent ${sig}, delivered ${got}`); return got; }
-    if (attempt < 3) log(`  swap ${sig.slice(0, 12)}… was not included; re-quoting (attempt ${attempt + 1} of 3)`);
+    const f = (await pollConfirm(conn, s.sig, s.lastValidBlockHeight, log)) ? "landed" : await fate(conn, s);
+    if (f === "landed") { const got = await settle(s.sig); log(`  swap sent ${s.sig}, delivered ${got}`); return got; }
+    if (f === "failed") throw new Error(`swap ${s.sig} failed on-chain; the epoch resumes on the next run`);
+    // re-quoted only once the last swap provably cannot land: two swaps of one pot would spend another sink's tokens
+    if (f === null) throw new Error(`swap ${s.sig} is neither confirmed nor expired; the epoch resumes on the next run`);
+    if (attempt < 3) log(`  swap ${s.sig.slice(0, 12)}… was not included; re-quoting (attempt ${attempt + 1} of 3)`);
   }
   throw new Error(`swap not landing after 3 attempts (last ${leg.swapSig}); the epoch resumes on the next run`);
 }
@@ -304,7 +366,11 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
   const mintState = await mintWithheld(conn, mint);
   if (!state) state = { epoch, mint: token.mint, startedAt: new Date().toISOString(), sweep: { done: false, sigs: [], withheldBefore: mintState.withheld.toString() }, sinks: [] };
   const statePath = path.join(dir, `epoch-${epoch}.state.json`);
-  const save = () => { if (!opts.dryRun) fs.writeFileSync(statePath, JSON.stringify(state, null, 1)); };
+  const save = () => { if (!opts.dryRun) writeAtomic(statePath, JSON.stringify(state, null, 1)); };
+  /** Persists a sink's payment the moment it is signed, before it is sent (see sendOnce). */
+  const keep = (st: SinkState) => (s: Sent) => { st.pending = s; save(); };
+  /** Send one transaction of sink `st`'s payment, exactly once. The caller records the signature and clears `st.pending` in one save. */
+  const pay = async (st: SinkState, ixs: TransactionInstruction[]) => { const sig = await sendOnce(conn, ixs, opts.operator!, keep(st), log); log(`  sent ${sig}`); return sig; };
   log(`[${token.symbol}] epoch ${epoch} ${opts.dryRun ? "DRY RUN" : "EXECUTE"} operator=${operatorPk.toBase58()}`);
 
   // 1. accounts, withheld, sweep
@@ -435,7 +501,12 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       log(`  sink ${i} ${sink.type}: done earlier (${st.sigs.length} txs)`);
       // Record what the earlier run did, from its persisted state, so the ledger reads the same as an uninterrupted epoch.
       const why = st.kept ? st.keptWhy : undefined;
-      if (sink.type === "reflections") records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: sink.payoutMint === "same" ? token.mint : sink.payoutMint, pot: st.kept ? "0" : st.converted ?? pot.toString(), paid: st.allocations?.length ?? 0, entries: (st.allocations ?? []).map(([owner, amount]) => ({ owner, amount })), root: st.root, kept: st.kept, keptWhy: why, keptIn: st.keptIn, resumed: true, sigs: st.sigs });
+      // a holder sink publishes what it actually paid (its frozen pay list) and what its allocation can be recomputed from, as it would have unresumed
+      if (sink.type === "reflections") records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: sink.payoutMint === "same" ? token.mint : sink.payoutMint,
+        pot: st.kept ? "0" : (BigInt(st.converted ?? pot.toString()) + BigInt(st.carriedIn ?? "0")).toString(), paid: (st.payList ?? st.allocations)?.length ?? 0,
+        redistributed: st.redistributed, minAmount: st.minAmount, minUsd: sink.minUsd, tokenPriceUsd: st.tokenPriceUsd,
+        entries: (st.payList ?? st.allocations ?? []).map(([owner, amount]) => ({ owner, amount })), allocations: st.allocations?.map(([owner, amount]) => ({ owner, amount })),
+        lottery: st.lottery, carriedIn: st.carriedIn, remainder: st.remainder, root: st.root, kept: st.kept, keptWhy: why, keptIn: st.keptIn, resumed: true, sigs: st.sigs });
       else if (sink.type === "burn") records.push({ type: "burn", pot, asset: sink.asset && sink.asset !== "same" ? sink.asset : undefined, converted: st.converted, kept: st.kept, keptWhy: why, resumed: true, sigs: st.sigs });
       else { const pm = sinkPayoutMint(sink, token); records.push({ type: sink.type, wallet: sink.wallet, pot, asset: pm === token.mint ? "token" : pm === token.quoteMint ? "quote" : pm, payoutMint: pm, converted: st.converted, kept: st.kept, keptWhy: why, deferred: st.note?.startsWith("deferred") ? st.note.slice(9) : undefined, resumed: true, sigs: st.sigs }); }
       continue;
@@ -444,11 +515,14 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
 
     if (sink.type === "burn") {
       const burnMint = sinkPayoutMint(sink, token);
+      // a burn an earlier run sent for this sink is settled first: landed = burned, nothing is burned twice
+      const earlier = opts.dryRun ? undefined : await landed(conn, st.pending, log);
+      const burned = (sig: string | undefined) => { if (sig) st.sigs.push(sig); st.pending = undefined; st.done = true; save(); };
       if (burnMint === token.mint) {
         // the tax is collected in the token itself, so burning it is a buyback-and-burn with the buy already done
         const ix = createBurnCheckedInstruction(operatorTokenAta, mint, operatorPk, pot, token.decimals, [], TOKEN_2022_PROGRAM_ID);
-        if (!opts.dryRun) st.sigs.push(...(await sendAll(conn, [ix], 1, opts.operator!, log)));
-        st.done = true; save(); records.push({ type: "burn", pot, sigs: st.sigs }); log(`  burn ${pot}`); continue;
+        burned(earlier ?? (opts.dryRun ? undefined : await pay(st, [ix])));
+        records.push({ type: "burn", pot, sigs: st.sigs }); log(`  burn ${pot}`); continue;
       }
       // buy another asset with the tax and burn that (e.g. a community's token); SOL has no burn instruction, so it is refused at registration
       if (burnMint === SOL_MINT) throw new Error(`sink ${i}: SOL cannot be burned; pick a token to buy and burn`);
@@ -461,8 +535,8 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       }
       const bPk = new PublicKey(burnMint); const { program, decimals } = await mintProgramAndDecimals(conn, bPk);
       const ix = createBurnCheckedInstruction(getAssociatedTokenAddressSync(bPk, operatorPk, true, program), bPk, operatorPk, bought, decimals, [], program);
-      if (!opts.dryRun && bought > 0n) st.sigs.push(...(await sendAll(conn, [ix], 1, opts.operator!, log)));
-      st.done = true; save(); records.push({ type: "burn", pot, asset: burnMint, converted: bought, sigs: st.sigs });
+      burned(earlier ?? (!opts.dryRun && bought > 0n ? await pay(st, [ix]) : undefined));
+      records.push({ type: "burn", pot, asset: burnMint, converted: bought, sigs: st.sigs });
       log(`  burn: bought ${bought} of ${burnMint.slice(0, 6)}… with ${pot} ${token.symbol} and burned it`); continue;
     }
 
@@ -470,13 +544,16 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       const dest = new PublicKey(sink.wallet);
       const outMint = sinkPayoutMint(sink, token); // the quote (default), the token itself, or the asset the dev picked
       const asset = outMint === token.mint ? "token" : outMint === token.quoteMint ? "quote" : outMint;
-      if (outMint === token.mint) {
+      const native = outMint === SOL_MINT, carryKey = `_sink:${i}`;
+      // a payment an earlier run sent for this sink is settled before anything is worked out again: landed = paid, nothing is sent twice
+      let sig = opts.dryRun ? undefined : await landed(conn, st.pending, log);
+      if (!sig && outMint === token.mint) {
         const destAta = getAssociatedTokenAddressSync(mint, dest, true, TOKEN_2022_PROGRAM_ID);
         const ixs = [createAssociatedTokenAccountIdempotentInstruction(operatorPk, destAta, dest, mint, TOKEN_2022_PROGRAM_ID),
           createTransferCheckedInstruction(operatorTokenAta, mint, destAta, operatorPk, pot, token.decimals, [], TOKEN_2022_PROGRAM_ID)];
-        if (!opts.dryRun) st.sigs.push(...(await sendAll(conn, ixs, 2, opts.operator!, log)));
+        if (!opts.dryRun) sig = await pay(st, ixs);
         log(`  ${sink.type} → ${sink.wallet} ${pot} ${token.symbol} (token; the token's own tax applies once more)`);
-      } else {
+      } else if (!sig) {
         const out = await partOf(i, outMint);
         if (out === null) {
           const why = keptWhy(i);
@@ -484,12 +561,10 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
           st.note = `${why}; kept for next epoch`; st.kept = pot.toString(); st.keptWhy = why; st.done = true; save();
           records.push({ type: sink.type, wallet: sink.wallet, pot: "0", asset, payoutMint: outMint, kept: pot, keptWhy: why, sigs: [] }); continue;
         }
-        const native = outMint === SOL_MINT;
         const ixs: TransactionInstruction[] = [];
         let sending = out; // what leaves the operator: the sink's part, plus for SOL anything deferred in earlier epochs
         if (native) {
           const carry = loadCarry(dir);
-          const carryKey = `_sink:${i}`;
           const owed = out + BigInt(carry[carryKey] ?? carry[sink.wallet] ?? "0");
           const { now, defer } = await deliverable(conn, [[sink.wallet, owed]]);
           if (defer.length) {
@@ -497,7 +572,6 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
             if (!opts.dryRun) { delete carry[sink.wallet]; carry[carryKey] = owed.toString(); saveCarry(dir, carry); }
             st.note = `deferred ${owed}`; st.done = true; save(); records.push({ type: sink.type, wallet: sink.wallet, pot, asset, payoutMint: outMint, converted: st.converted, deferred: owed }); continue;
           }
-          if ((carry[carryKey] || carry[sink.wallet]) && !opts.dryRun) { delete carry[carryKey]; delete carry[sink.wallet]; saveCarry(dir, carry); }
           sending = now[0][1];
           ixs.push(SystemProgram.transfer({ fromPubkey: operatorPk, toPubkey: dest, lamports: sending }));
         } else {
@@ -507,10 +581,14 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
           ixs.push(createAssociatedTokenAccountIdempotentInstruction(operatorPk, destAta, dest, oPk, program),
             createTransferCheckedInstruction(getAssociatedTokenAddressSync(oPk, operatorPk, true, program), oPk, destAta, operatorPk, out, decimals, [], program));
         }
-        if (!opts.dryRun && sending > 0n) st.sigs.push(...(await sendAll(conn, ixs, 2, opts.operator!, log)));
+        if (!opts.dryRun && sending > 0n) sig = await pay(st, ixs);
         log(`  ${sink.type} → ${sink.wallet} ${out} of ${asset === "quote" ? "quote" : `${outMint.slice(0, 6)}…`}`);
       }
-      st.done = true; save(); records.push({ type: sink.type, wallet: sink.wallet, pot, asset, payoutMint: outMint, converted: st.converted, sigs: st.sigs }); continue;
+      // paid: SOL deferred in earlier epochs went out with this payment, so it is struck off now, never before the payment has landed
+      // (until 2026-10-03 it was struck off before sending, and a send that failed lost it from the books)
+      if (native && !opts.dryRun) { const c = loadCarry(dir); if (c[carryKey] || c[sink.wallet]) { delete c[carryKey]; delete c[sink.wallet]; saveCarry(dir, c); } }
+      if (sig) st.sigs.push(sig);
+      st.pending = undefined; st.done = true; save(); records.push({ type: sink.type, wallet: sink.wallet, pot, asset, payoutMint: outMint, converted: st.converted, sigs: st.sigs }); continue;
     }
 
     // reflections (the minimum holding and the number of eligible holders were settled in step 4, before the swaps)
@@ -547,15 +625,24 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       st.allocations = [...alloc.allocations.entries()].sort((a, b) => (b[1] > a[1] ? 1 : -1)).map(([o, a]) => [o, a.toString()]);
       st.carriedIn = carriedIn.toString(); st.remainder = alloc.remainder.toString();
       st.note = `rule=${sink.rule.type} eligible=${alloc.eligible} remainder=${alloc.remainder}${carriedIn ? ` carriedIn=${carriedIn}` : ""}`;
-      if (!opts.dryRun) { carry[`_pot:${i}`] = alloc.remainder.toString(); saveCarry(dir, carry); }
-      save();
+      save(); // the carry file learns the new remainder only after this (applyCarry), so a run that dies in between still finds what it carried in
     }
+    /** The carry file, once per epoch and sink: what the sink consumed is struck off and its pot carry becomes this epoch's remainder plus
+     *  anything rolled over. Setting rather than adding, after the state that says so is saved, makes a repeat after a crash harmless. */
+    const applyCarry = () => {
+      if (opts.dryRun || st.carryDone) return;
+      const c = loadCarry(dir);
+      for (const k of st.consumed ?? []) delete c[k];
+      c[`_pot:${i}`] = (BigInt(st.remainder ?? "0") + BigInt(st.rolled ?? "0")).toString();
+      saveCarry(dir, c); st.carryDone = true; save();
+    };
     const recipients = st.allocations.map(([o, a]) => [o, BigInt(a)] as [string, bigint]);
     payoutPot = payoutPot + BigInt(st.carriedIn ?? "0");
     log(`  reflections ${st.note} paid=${recipients.length} pot=${payoutPot}`);
 
     if (sink.distribution === "claim") {
       const { tree, leaves } = balanceTree(recipients.map(([o, a]) => ({ account: new PublicKey(o).toBytes(), amount: a })));
+      applyCarry();
       st.root = toHex(tree.root); st.done = true; save();
       records.push({ type: "reflections", mode: "claim", rule: sink.rule, payoutMint: payoutMint.toBase58(), pot: payoutPot, root: st.root, minAmount: minAmount.toString(), minUsd: sink.minUsd, tokenPriceUsd: tokenUsd ?? undefined, lottery: st.lottery,
         entries: recipients.map(([owner, amount], k) => ({ index: k, owner, amount, proof: tree.proof(leaves[k].leaf).map(toHex) })) });
@@ -563,12 +650,11 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     }
 
     const nativeSol = payoutMint.toBase58() === SOL_MINT;
-    const perTx = nativeSol ? 20 : 12, perRecipient = nativeSol ? 1 : 2;
-    const ixs: TransactionInstruction[] = [];
-    let newAtas = 0;
-    let payList = recipients;
-    let redistributed = 0n;
-    {
+    const perTx = nativeSol ? 20 : 12;
+    // Who is paid what is worked out ONCE and frozen with the state before the first batch is sent: a resumed run pays exactly this list,
+    // in exactly these batches, whatever changed on-chain since. (Until 2026-10-03 a resumed run worked it out again from the chain and the
+    // carry file, which the first attempt had already changed, so a price or balance move could shift the batches it skipped.)
+    if (!st.payList) {
       const carry = loadCarry(dir);
       const merged = new Map<string, bigint>(recipients);
       let now: [string, bigint][] = [], defer: [string, bigint][] = [], reason = "";
@@ -596,18 +682,17 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
           const worth = priced ? Number(v) * priced.lamportsPerUnit : 0;
           (worth >= minFirst ? now : defer).push([o, v]);
         }
-        newAtas = now.filter(([o]) => !exists.has(o)).length;
+        st.newAtas = now.filter(([o]) => !exists.has(o)).length;
         reason = `a new token account (${Number(ATA_RENT) / 1e9} SOL) is not funded for a first payout under $${MIN_FIRST_PAYOUT_USD}${priced ? "" : "; payout price unknown this epoch"}`;
       }
       const { paid, moved, rolled } = redistribute(now, defer);
-      payList = paid; redistributed = moved;
       if (defer.length) log(`  ${defer.length} payouts not deliverable (${reason}): ${moved > 0n ? `${moved} redistributed pro-rata to the ${paid.length} holders paid this epoch` : `${rolled} rolled into the next epoch's pot`}`);
-      if (!opts.dryRun && (consumed.length || rolled > 0n)) {
-        const nc: Carry = {}; for (const [k, v] of Object.entries(carry)) if (!consumed.includes(k)) nc[k] = v;
-        if (rolled > 0n) nc[`_pot:${i}`] = (BigInt(nc[`_pot:${i}`] ?? "0") + rolled).toString();
-        saveCarry(dir, nc);
-      }
+      st.payList = paid.map(([o, a]) => [o, a.toString()]); st.redistributed = moved.toString(); st.rolled = rolled.toString(); st.consumed = consumed;
+      save();
     }
+    applyCarry();
+    const payList = st.payList.map(([o, a]) => [o, BigInt(a)] as [string, bigint]);
+    const ixs: TransactionInstruction[] = [];
     for (const [owner, amount] of payList) {
       const dest = new PublicKey(owner);
       if (nativeSol) ixs.push(SystemProgram.transfer({ fromPubkey: operatorPk, toPubkey: dest, lamports: amount }));
@@ -618,20 +703,25 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       }
     }
     const batches = Math.ceil(ixs.length / perTx);
-    const skip = (st.paidBatches ?? 0) * perTx;
-    log(`  push${nativeSol ? " (native SOL)" : ""}: ${payList.length} transfers in ${batches} txs${skip ? ` (resuming after ${st.paidBatches} paid batches)` : ""}; worst-case ATA rent ${Number(ATA_RENT * BigInt(newAtas)) / 1e9} SOL`);
+    log(`  push${nativeSol ? " (native SOL)" : ""}: ${payList.length} transfers in ${batches} txs${st.paidBatches ? ` (resuming after ${st.paidBatches} paid batches)` : ""}; worst-case ATA rent ${Number(ATA_RENT * BigInt(st.newAtas ?? 0)) / 1e9} SOL`);
     if (!opts.dryRun) {
-      const remaining = ixs.slice(skip);
-      await sendAll(conn, remaining, perTx, opts.operator!, log, (sig) => { st.sigs.push(sig); st.paidBatches = (st.paidBatches ?? 0) + 1; save(); });
+      // the batch an earlier run had in flight (always batch number `paidBatches`) is settled first: landed = paid, not sent again
+      const earlier = await landed(conn, st.pending, log);
+      if (earlier) { st.sigs.push(earlier); st.paidBatches = (st.paidBatches ?? 0) + 1; }
+      st.pending = undefined; save();
+      for (let b = st.paidBatches ?? 0; b < batches; b++) {
+        const sig = await pay(st, ixs.slice(b * perTx, (b + 1) * perTx));
+        st.sigs.push(sig); st.paidBatches = b + 1; st.pending = undefined; save();
+      }
     }
-    void perRecipient;
     st.done = true; save();
-    records.push({ type: "reflections", mode: "push", rule: sink.rule, payoutMint: payoutMint.toBase58(), pot: payoutPot, paid: payList.length, redistributed, minAmount: minAmount.toString(), minUsd: sink.minUsd, tokenPriceUsd: tokenUsd ?? undefined, entries: payList.map(([owner, amount]) => ({ owner, amount })), allocations: st.allocations.map(([owner, amount]) => ({ owner, amount })), lottery: st.lottery, carriedIn: st.carriedIn, remainder: st.remainder, sigs: st.sigs });
+    records.push({ type: "reflections", mode: "push", rule: sink.rule, payoutMint: payoutMint.toBase58(), pot: payoutPot, paid: payList.length, redistributed: BigInt(st.redistributed ?? "0"), minAmount: minAmount.toString(), minUsd: sink.minUsd, tokenPriceUsd: tokenUsd ?? undefined, entries: payList.map(([owner, amount]) => ({ owner, amount })), allocations: st.allocations.map(([owner, amount]) => ({ owner, amount })), lottery: st.lottery, carriedIn: st.carriedIn, remainder: st.remainder, sigs: st.sigs });
   }
 
   // every record says what its sink brought along from the last epoch, so the pots can be recomputed from the published ledger
   records.forEach((r, i) => { if (ep.sinks[i]?.keptIn && r && typeof r === "object") (r as { keptIn?: string }).keptIn = ep.sinks[i].keptIn; });
-  state.finished = true; save();
+  // the record is written before the state is marked finished: a run that dies in between resumes, finds every sink done and writes the
+  // same record again (the other order could leave a finished epoch with no record, and the next run would start the same number afresh)
   const file = ledger.writeEpoch({
     epoch, ranAt: new Date().toISOString(), dryRun: opts.dryRun, mint: token.mint,
     tax: taxRecord(state, withheldRows.length, available, opts.dryRun),
@@ -641,6 +731,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     signatures: [...new Set([...state.sweep.sigs, ...(ep.conversions ?? []).flatMap((c) => c.sigs), ...state.sinks.flatMap((s) => s.sigs)])],
     snapshot: state.snapshot,
   });
+  state.finished = true; save();
   log(`  ledger → ${file}`);
   return { epoch, available, file };
 }
