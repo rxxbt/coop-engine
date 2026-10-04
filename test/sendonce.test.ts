@@ -15,7 +15,8 @@ function chain(outcomes: Outcome[], step = 10) {
   const conn = {
     getLatestBlockhash: async () => ({ blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: c.height + 150 }),
     getBlockHeight: async () => (c.height += step),
-    sendRawTransaction: async (raw: Uint8Array) => {
+    sendRawTransaction: async (raw: Uint8Array, opts?: { maxRetries?: number }) => {
+      assert.equal(opts?.maxRetries, undefined, "no cap on the RPC's re-broadcasting");
       const sig = bs58.encode(Transaction.from(raw).signature!);
       const o = outcomes[c.sends.length] ?? "drop";
       if (o === "stale") { outcomes.splice(c.sends.length, 1); throw new Error("Simulation failed. \nMessage: Transaction simulation failed: Blockhash not found."); }

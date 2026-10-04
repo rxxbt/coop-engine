@@ -144,7 +144,7 @@ export async function runFees(cfg: EngineConfig, opts: FeeRunOptions, platformId
         if (tx instanceof VersionedTransaction) { tx.message.recentBlockhash = bh.blockhash; tx.sign([operator]); raw = tx.serialize(); sig = bs58.encode(tx.signatures[0]); }
         else { tx.recentBlockhash = bh.blockhash; tx.feePayer = operator.publicKey; tx.sign(operator); raw = tx.serialize(); sig = bs58.encode(tx.signature!); }
         st[slot] = { sig, lastValidBlockHeight }; save();
-        try { await conn.sendRawTransaction(raw, { maxRetries: 3 }); break; }
+        try { await conn.sendRawTransaction(raw); break; } // re-broadcast by the RPC until it lands or expires (see sendOnce in src/epoch.ts)
         catch (e) { if (isStaleBlockhash(e) && attempt < 3) { log(`${tag} ${slot}: the RPC did not know the blockhash yet (nothing sent); sending again`); await new Promise((r) => setTimeout(r, 2000)); continue; } throw e; }
       }
       if (!(await pollConfirm(conn, sig, lastValidBlockHeight, log))) throw new Error(`${tag} ${slot} ${sig} not confirmed in time; the next run resumes here`);

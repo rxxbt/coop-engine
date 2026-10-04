@@ -199,7 +199,9 @@ export async function sendOnce(conn: Connection, ixs: TransactionInstruction[], 
     tx.sign(signer);
     const s: Sent = { sig: bs58.encode(tx.signature!), lastValidBlockHeight };
     keep(s);
-    try { await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 }); }
+    // no maxRetries: the RPC re-broadcasts until the transaction lands or its blockhash expires. Capped at 3 (2026-10-01 → 10-04), 9.1 of
+    // every 100 transactions expired unsent and needed a second one (0.6 before), and three in a row failed an epoch on 2026-10-04.
+    try { await conn.sendRawTransaction(tx.serialize()); }
     catch (e) {
       // the node that checked the transaction did not know its blockhash yet: it was refused before being sent, so sending again is safe
       if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the blockhash yet (nothing sent); sending again (attempt ${attempt + 1} of 3)`); await sleep(timing.staleMs); continue; }
@@ -296,7 +298,7 @@ async function swapLeg(conn: Connection, cfg: EngineConfig, opts: RunOptions, in
     // persisted before sending, like every payment; Jupiter's blockhash is at most a few blocks old, so +300 is a safe stand-in for its expiry
     const s: Sent = { sig: bs58.encode(vtx.signatures[0]), lastValidBlockHeight: lastValidBlockHeight ?? (await conn.getBlockHeight("confirmed")) + 300 };
     leg.swapSig = s.sig; leg.lastValidBlockHeight = s.lastValidBlockHeight; save();
-    try { await conn.sendTransaction(vtx, { maxRetries: 3 }); }
+    try { await conn.sendTransaction(vtx); } // re-broadcast by the RPC until it lands or expires, like every payment (see sendOnce)
     catch (e) { if (isStaleBlockhash(e) && attempt < 3) { log(`  the RPC did not know the swap's blockhash yet (nothing sent); re-quoting (attempt ${attempt + 1} of 3)`); continue; } throw e; }
     const f = (await pollConfirm(conn, s.sig, s.lastValidBlockHeight, log)) ? "landed" : await fate(conn, s);
     if (f === "landed") { const got = await settle(s.sig); log(`  swap sent ${s.sig}, delivered ${got}`); return got; }
@@ -391,9 +393,13 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       if (harvestIxs.length) state.sweep.sigs.push(...(await sendAll(conn, harvestIxs, 1, opts.operator, log)));
       const after = await mintWithheld(conn, mint);
       state.sweep.swept = after.withheld.toString(); // exactly what the withdraw below moves out of the mint
-      const ixs: TransactionInstruction[] = [createAssociatedTokenAccountIdempotentInstruction(operatorPk, operatorTokenAta, operatorPk, mint, TOKEN_2022_PROGRAM_ID)];
-      if (after.withheld > 0n) ixs.push(withdrawFromMintInstruction(mint, operatorTokenAta, operatorPk));
-      state.sweep.sigs.push(...(await sendAll(conn, ixs, 2, opts.operator, log)));
+      // nothing to withdraw and the operator's account for the token exists: no transaction. Until 2026-10-04 every epoch sent one anyway
+      // (the account creation, a no-op), about half of all the operator's transactions and fees, and one of them failed an epoch that day.
+      if (after.withheld > 0n || !(await conn.getAccountInfo(operatorTokenAta))) {
+        const ixs: TransactionInstruction[] = [createAssociatedTokenAccountIdempotentInstruction(operatorPk, operatorTokenAta, operatorPk, mint, TOKEN_2022_PROGRAM_ID)];
+        if (after.withheld > 0n) ixs.push(withdrawFromMintInstruction(mint, operatorTokenAta, operatorPk));
+        state.sweep.sigs.push(...(await sendAll(conn, ixs, 2, opts.operator, log)));
+      }
       state.sweep.done = true; save();
     }
     // source of truth after a sweep: whatever the operator holds (includes leftovers of any earlier failed run).
