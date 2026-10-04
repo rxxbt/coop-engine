@@ -394,7 +394,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       const after = await mintWithheld(conn, mint);
       state.sweep.swept = after.withheld.toString(); // exactly what the withdraw below moves out of the mint
       // nothing to withdraw and the operator's account for the token exists: no transaction. Until 2026-10-04 every epoch sent one anyway
-      // (the account creation, a no-op), about half of all the operator's transactions and fees, and one of them failed an epoch that day.
+      // (the account creation, a no-op): 527 of the operator's 552 transactions in the 24 hours before, and one of them failed an epoch.
       if (after.withheld > 0n || !(await conn.getAccountInfo(operatorTokenAta))) {
         const ixs: TransactionInstruction[] = [createAssociatedTokenAccountIdempotentInstruction(operatorPk, operatorTokenAta, operatorPk, mint, TOKEN_2022_PROGRAM_ID)];
         if (after.withheld > 0n) ixs.push(withdrawFromMintInstruction(mint, operatorTokenAta, operatorPk));
