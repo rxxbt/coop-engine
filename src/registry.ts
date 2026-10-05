@@ -11,7 +11,7 @@ import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { LAUNCHPAD_PROGRAM, LaunchpadPool, getPdaLaunchpadPoolId } from "@raydium-io/raydium-sdk-v2";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
-import { validateToken, type Sink, type TokenConfig } from "./config.js";
+import { validateToken, type Sink, type Stage, type TokenConfig } from "./config.js";
 import { mintWithheld } from "./sweep.js";
 
 /** How long a registration waits for a pool its RPC cannot see yet: 15 × 2 s. Env overrides exist for tests. At most POOL_WAITERS
@@ -24,6 +24,9 @@ export type Manifest = {
   mint: string; symbol: string; decimals: number; quoteMint: string; platformId: string; creator: string;
   launchSig?: string;
   sinks: Sink[]; epochHours: number; exclusions: string[];
+  /** Since 2026-10-05 (all optional; a manifest without them reads as before): later recipes, buy-tax refunds, the launch's vesting lock
+   *  and whether it earns, and the referral share the token page puts on curve trades. Mirrored in console/src/manifest.ts. */
+  stages?: Stage[]; refund?: TokenConfig["refund"]; vesting?: TokenConfig["vesting"]; referralBps?: number;
   createdAt: string;
 };
 
@@ -38,7 +41,8 @@ export type VerifyOptions = { platformIds: string[]; operator: string; /** tests
 
 export async function verifyManifest(conn: Connection, m: Manifest, signature: string, opts: VerifyOptions): Promise<TokenConfig> {
   if (!m || m.version !== 1) throw new Error("unsupported manifest version");
-  const token: TokenConfig = { mint: m.mint, symbol: m.symbol, quoteMint: m.quoteMint, decimals: m.decimals, exclusions: m.exclusions ?? [], sinks: m.sinks, epochHours: m.epochHours };
+  const token: TokenConfig = { mint: m.mint, symbol: m.symbol, quoteMint: m.quoteMint, decimals: m.decimals, exclusions: m.exclusions ?? [], sinks: m.sinks, epochHours: m.epochHours,
+    ...(m.stages !== undefined ? { stages: m.stages } : {}), ...(m.refund !== undefined ? { refund: m.refund } : {}), ...(m.vesting !== undefined ? { vesting: m.vesting } : {}), ...(m.referralBps !== undefined ? { referralBps: m.referralBps } : {}) };
   validateToken(token);
   if (typeof m.createdAt !== "string" || Math.abs(Date.now() - Date.parse(m.createdAt)) > 24 * 3_600_000) throw new Error("manifest createdAt must be within 24 h of now");
   if (m.launchSig !== undefined && !/^[1-9A-HJ-NP-Za-km-z]{60,120}$/.test(m.launchSig)) throw new Error("launchSig is not a signature");

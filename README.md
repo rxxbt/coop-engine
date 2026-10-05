@@ -37,6 +37,23 @@ itself or any asset Jupiter routes), `treasury`, `creator` and `burn`. Each hold
 The rules are pure functions over the published snapshot; the tests check, among other things, that splitting a wallet
 never increases its payout.
 
+## Dials
+
+Every one of these is the creator's choice at launch, signed in the manifest, and off unless chosen (since 2026-10-05).
+
+| Dial | What the engine does |
+|---|---|
+| Buy-tax refund (`refund.mode`) | Every epoch, before the split, the engine reads the pool vaults' own transactions, finds the buys, works out the tax each buyer paid from the balance changes and pays it back, grossed up for the refund's own tax (`src/refunds.ts`). `holders` pays only buyers still holding everything they bought in the window at the snapshot; `all` pays every buyer. Every refund is in the ledger with the buy it answers. |
+| Later recipe (`stages`) | A second set of sinks that takes over at graduation, at a holder count (the last snapshot) or at a market cap. Checked at the start of every epoch, entered in order, never left; the carry file follows the sinks; the epoch record carries the stage and what the check saw (`src/stages.ts`). |
+| Minimum holding age (`minAgeHours` on a holder sink) | Tokens count only once their lot has sat in the wallet that long, per lot, for eligibility and for the split (`agedHolder` in `src/rules.ts`). `verify` recomputes it from the published lots. |
+| Jackpot (`every` on a lottery rule) | The sink draws every N epochs; between draws its pot stays with the sink (`keptWhy: accruing`, `drawAt` in the record). |
+| Locked team share (`vesting`) | The launch locked a slice of the supply through LaunchLab's vesting; when `earns` is set the locked, unclaimed amount counts as held by the creator in every snapshot (`vested` on the row). |
+| Referral share (`referralBps`) | The share fee the token page puts on curve trades; the engine only publishes it. |
+
+Pool fees after graduation (`src/fees.ts`): the dev's 0.42% of the pool's volume is fixed. Raydium's program keeps a share of the creator
+fee at claim time (5% on tier 9 since 2026-10-01); the split reads the rates at every claim, records them, and gives the dev their 0.42%
+out of what arrives.
+
 ## Verify an epoch yourself
 
 ```bash
@@ -55,7 +72,6 @@ npx tsx src/cli.ts tokens                     # every token the engine knows
 npx tsx src/cli.ts epoch <mint>               # dry run: quotes, allocations, nothing sent
 npx tsx src/cli.ts epoch <mint> --execute     # signs with the operator key
 npx tsx src/cli.ts epoch --all --execute      # the scheduler: every token whose epoch is due
-npx tsx src/cli.ts fees --all                 # dry run: graduated pools' creator fees, what would be forwarded
 npm test
 ```
 
@@ -70,14 +86,6 @@ engine sweep the tax, and it signs every payout. What that key does every epoch 
 is public. Tokens register by a message their creator signs before launch; the engine accepts a registration only when the
 pool exists on a COOP platform account, was created by the signer, and its tax can be withdrawn by the operator
 (`src/registry.ts`).
-
-## After graduation
-
-A token that completes its curve migrates into a Raydium CPMM pool whose recorded creator is the operator. Every swap there pays a
-0.75% creator fee into the pool. Once a day `scripts/run-fees.sh` claims those fees for every graduated token on a COOP platform account
-and sends the token's creator 42/75 of each claim (0.42 of the pool's 1.00%); the rest goes to the platform's fee wallet. A pool's fees
-are claimed only once the creator's share is worth at least $1; until then they keep accruing in the pool. Every claim and transfer is
-recorded per token and served with the token's ledger (`src/fees.ts`).
 
 ## Layout
 

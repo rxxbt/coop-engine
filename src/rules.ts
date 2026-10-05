@@ -20,8 +20,19 @@ export type Holder = {
 
 export type Allocation = { allocations: Map<string, bigint>; remainder: bigint; eligible: number };
 
-/** `at` = the snapshot's time in ms: holding time is measured up to it. */
-export type AllocateOptions = { minAmount?: bigint; exclude?: Set<string>; seed?: string; at?: number };
+/** `at` = the snapshot's time in ms: holding time is measured up to it. `minAgeMs` (since 2026-10-05): tokens count only once their lot has
+ *  sat in the wallet that long; a snapshot row without lots (published before 2026-09-29) cannot age and counts whole. */
+export type AllocateOptions = { minAmount?: bigint; exclude?: Set<string>; seed?: string; at?: number; minAgeMs?: number };
+
+/** The holder as the rules see them under a minimum holding age: only the lots old enough, and their sum as the balance. Per lot, so a
+ *  sniper who flips inside the window holds nothing that counts, a top-up starts its own clock, and splitting wallets gains nothing. */
+export function agedHolder(h: Holder, minAgeMs: number | undefined, at: number): Holder {
+  if (!minAgeMs || minAgeMs <= 0 || !h.lots) return h;
+  const lots = h.lots.filter((l) => at - l.since >= minAgeMs);
+  let amount = lots.reduce((a, l) => a + l.amount, 0n);
+  if (amount > h.amount) amount = h.amount;
+  return { ...h, amount, lots };
+}
 
 export type AgedRule = Extract<Rule, { type: "time-weighted"; intervalHours: number }>;
 export const isAged = (r: Rule): r is AgedRule => r.type === "time-weighted" && "intervalHours" in r;
@@ -65,7 +76,8 @@ function merge(into: Map<string, bigint>, from: Map<string, bigint>) {
 export function allocate(rule: Rule, holders: Holder[], pot: bigint, opts: AllocateOptions = {}): Allocation {
   const min = opts.minAmount ?? 0n;
   const ex = opts.exclude ?? new Set<string>();
-  const eligible = holders.filter((h) => h.amount >= min && h.amount > 0n && !ex.has(h.owner));
+  const now = opts.at ?? Date.now();
+  const eligible = holders.map((h) => agedHolder(h, opts.minAgeMs, now)).filter((h) => h.amount >= min && h.amount > 0n && !ex.has(h.owner));
   const allocations = new Map<string, bigint>();
 
   if (eligible.length === 0 || pot <= 0n) return { allocations, remainder: pot, eligible: 0 };

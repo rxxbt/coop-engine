@@ -33,6 +33,11 @@ cat "$RUN" >> "$LOG"
 fwd=$(grep -E '^\[fees [^]]+\] forwarded [0-9]' "$RUN" | cut -c1-300)
 [ -n "$fwd" ] && alert "COOP engine · pool fees forwarded at $(date -u +%H:%M) UTC
 $fwd"
+# Raydium's program keeps a share of the creator fee at claim time (5% on tier 9 since 2026-10-01); the engine reads the rate at every claim
+# and says so when it moved. The dev's 0.42% is fixed by the split; what moves is the platform's part.
+changed=$(grep -E 'RAYDIUM SHARE CHANGED' "$RUN" | head -n 3 | cut -c1-300)
+[ -n "$changed" ] && alert "COOP engine · Raydium changed the creator-fee rates at $(date -u +%H:%M) UTC
+$changed"
 if [ "$rc" -ne 0 ]; then
   failed=$(grep -E 'FAILED' "$RUN" | tail -n 5 | cut -c1-300)
   alert "COOP engine · pool-fee run failed at $(date -u +%H:%M) UTC

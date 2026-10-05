@@ -13,18 +13,24 @@ import {
   TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction,
   createTransferCheckedInstruction, createBurnCheckedInstruction, unpackMint, unpackAccount,
 } from "@solana/spl-token";
-import { sinkPayoutMint, type EngineConfig, type TokenConfig, type Sink } from "./config.js";
+import { sinkPayoutMint, sinksAt, type EngineConfig, type TokenConfig, type Sink } from "./config.js";
 import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { withheldOf, harvestInstructions, mintWithheld, withdrawFromMintInstruction } from "./sweep.js";
-import { allocate, type Holder } from "./rules.js";
+import { allocate, agedHolder, type Holder } from "./rules.js";
 import { NoRouteError, TooSmallError, formPots, keptBySink, runConversions, shareOf, type ConversionProgress, type ConversionState } from "./plan.js";
 import { balanceTree, toHex } from "./merkle.js";
 import { quote, swapTransaction } from "./jupiter.js";
-import { LAUNCHPAD_PROGRAM, LaunchpadPool, getPdaLaunchpadPoolId } from "@raydium-io/raydium-sdk-v2";
+import { LAUNCHPAD_PROGRAM, LaunchpadPool, LaunchpadVesting, getPdaLaunchpadPoolId, getPdaVestId, CREATE_CPMM_POOL_PROGRAM, CpmmPoolInfoLayout, getCpmmPdaPoolId } from "@raydium-io/raydium-sdk-v2";
 import { Ledger, type SnapshotRow } from "./ledger.js";
+import { absorbParked, nextStage, readStage, rekeyCarry, whenText, writeStage, type StageFacts } from "./stages.js";
+import { buysOf, planRefunds, signaturesSince, type Buy, type RefundEntry, type RefundRecord } from "./refunds.js";
 
 const LAUNCHLAB = new PublicKey("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj");
 const CPMM_AUTH = "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL";
+/** The CPMM fee tier every COOP platform account graduates into (tier 9); the pool of a graduated token is derived from it. */
+const CP_CONFIG_ID = new PublicKey(process.env.CP_CONFIG_ID || "LNmHRmMvk9kmtepfTSr98kqGLThd61kH1DPWf2cVRaC");
+/** Wallets whose receipts from a pool vault are never buys: the platform's fee wallet claims locked-LP fees in the token. */
+const PLATFORM_FEE_WALLET = process.env.PLATFORM_FEE_WALLET || "DjKWgaz5peaDPSdKBEFfQfbsMPgEQmCmCmRiHXrGcZ3c";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const ATA_RENT = 2_039_280n;
 const RENT_MIN = 890_880n; // lamports a system account must hold; a transfer that leaves less is rejected
@@ -32,8 +38,12 @@ const RENT_MIN = 890_880n; // lamports a system account must hold; a transfer th
  *  2026-10-02). Every swap costs the operator a network fee and a priority fee, and a route through a token the operator has no account
  *  for opens one (0.0015 SOL, refundable), which a dust pot cannot cover: on 2026-10-01 a pot worth 0.00034 SOL delivered nothing. */
 const MIN_SWAP_LAMPORTS = BigInt(process.env.MIN_SWAP_LAMPORTS ?? "2000000"); // 0.002 SOL
-/** Why a sink's pot was kept for the next epoch instead of paid; published with the sink's record. */
-type KeptWhy = "no route" | "too small" | "no eligible holder";
+/** Why a sink's pot was kept for the next epoch instead of paid; published with the sink's record. `accruing` (since 2026-10-05): a jackpot
+ *  lottery between draws. */
+type KeptWhy = "no route" | "too small" | "no eligible holder" | "accruing";
+/** A lottery sink that draws every N epochs keeps its pot in the epochs between (src/config.ts `every`). */
+const jackpotWaiting = (s: Sink, epoch: number) => s.type === "reflections" && s.rule.type === "lottery" && (s.rule.every ?? 1) > 1 && epoch % (s.rule.every ?? 1) !== 0;
+const nextDraw = (s: Sink, epoch: number) => { const n = s.type === "reflections" && s.rule.type === "lottery" ? (s.rule.every ?? 1) : 1; return Math.ceil(epoch / n) * n; };
 
 type Carry = Record<string, string>; // owner → lamports owed but too small to deliver yet
 function loadCarry(dir: string): Carry { try { return JSON.parse(fs.readFileSync(path.join(dir, "carry.json"), "utf8")); } catch { return {}; } }
@@ -117,9 +127,73 @@ type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink k
   pending?: Sent;
   /** A holder sink's final pay list (after first-payout deferrals and their redistribution), frozen before the first batch is sent, with
    *  what it took from and gave back to the carry file; `carryDone` once the carry file has it. */
-  payList?: [string, string][]; redistributed?: string; rolled?: string; consumed?: string[]; newAtas?: number; carryDone?: boolean };
+  payList?: [string, string][]; redistributed?: string; rolled?: string; consumed?: string[]; newAtas?: number; carryDone?: boolean;
+  /** A jackpot lottery between draws: the epoch of the next draw (since 2026-10-05). */
+  drawAt?: number };
 export type { SnapshotRow } from "./ledger.js";
-type EpochState = { epoch: number; mint: string; startedAt: string; sweep: { done: boolean; sigs: string[]; withheldBefore: string; available?: string; heldBefore?: string; swept?: string }; sinks: SinkState[]; conversions?: ConvState[]; finished?: boolean; snapshot?: { slot: number; at?: string; holders: SnapshotRow[] } };
+/** The epoch's buy-tax refunds, frozen in the state before the first transfer is sent and paid in batches like a holder sink (since 2026-10-05). */
+type RefundState = { mode: "holders" | "all"; cursors: Record<string, string>; buys: number; entries: RefundEntry[]; fees: string; refunded: string; forfeited: string; scaled: boolean; paidBatches?: number; pending?: Sent; sigs: string[]; done: boolean };
+type EpochState = { epoch: number; mint: string; startedAt: string; sweep: { done: boolean; sigs: string[]; withheldBefore: string; available?: string; heldBefore?: string; swept?: string }; sinks: SinkState[]; conversions?: ConvState[]; finished?: boolean; snapshot?: { slot: number; at?: string; holders: SnapshotRow[] };
+  /** Since 2026-10-05: the recipe stage this epoch runs under and what the check saw, frozen at the start; the refunds taken off the top. */
+  stage?: number; stageFacts?: StageFacts; refunds?: RefundState };
+
+/** What a stage check needs to know this epoch, read only for the condition types the token's stages use. */
+async function stageFactsOf(conn: Connection, token: TokenConfig, mint: PublicKey, ledger: Ledger, log: (s: string) => void): Promise<StageFacts> {
+  const needs = new Set((token.stages ?? []).map((s) => s.when.type));
+  let graduated = false, holders: number | null = null, mcapUsd: number | null = null;
+  if (needs.has("graduation")) {
+    const info = await conn.getAccountInfo(getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, new PublicKey(token.quoteMint)).publicKey);
+    graduated = info ? (LaunchpadPool.decode(info.data) as any).status === 2 : false;
+  }
+  if (needs.has("holders")) holders = ledger.lastRecord()?.snapshot?.holders.length ?? null;
+  if (needs.has("mcap")) {
+    const price = await tokenPriceUsd(conn, token, log);
+    const supply = await conn.getTokenSupply(mint).catch(() => null);
+    const units = supply ? Number(supply.value.amount) / 10 ** supply.value.decimals : null;
+    mcapUsd = price && units ? price * units : null;
+  }
+  return { graduated, holders, mcapUsd };
+}
+
+/** The creator's locked, unclaimed vesting allocation: what the launch locked (the pool's schedule) less what the creator's vesting record
+ *  says was claimed; the record's own share caps it when the creator is not the only beneficiary. Null when nothing is locked. */
+async function lockedUnclaimed(conn: Connection, token: TokenConfig, mint: PublicKey, creator: PublicKey): Promise<bigint | null> {
+  const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, new PublicKey(token.quoteMint)).publicKey;
+  const info = await conn.getAccountInfo(poolId);
+  if (!info) return null;
+  const pool: any = LaunchpadPool.decode(info.data);
+  let locked = BigInt(pool.vestingSchedule?.totalLockedAmount?.toString() ?? "0");
+  if (locked <= 0n) return null;
+  const rec = await conn.getAccountInfo(getPdaVestId(LAUNCHPAD_PROGRAM, poolId, creator).publicKey).catch(() => null);
+  if (rec) {
+    const v: any = LaunchpadVesting.decode(rec.data);
+    const share = BigInt(v.tokenShareAmount?.toString() ?? "0"), claimed = BigInt(v.claimedAmount?.toString() ?? "0");
+    if (share > 0n && share < locked) locked = share;
+    locked -= claimed;
+  }
+  return locked > 0n ? locked : 0n;
+}
+
+/** The pool vaults the token's buys come out of: the LaunchLab curve's base vault, and after graduation the CPMM pool's vault for the token. */
+async function vaultsOf(conn: Connection, token: TokenConfig, mint: PublicKey): Promise<Set<string>> {
+  const out = new Set<string>();
+  const quote = new PublicKey(token.quoteMint);
+  const info = await conn.getAccountInfo(getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, quote).publicKey);
+  if (info) {
+    const pool: any = LaunchpadPool.decode(info.data);
+    out.add(pool.vaultA.toBase58());
+    if (pool.status === 2) {
+      for (const [a, b] of [[mint, quote], [quote, mint]]) {
+        const cp = await conn.getAccountInfo(getCpmmPdaPoolId(CREATE_CPMM_POOL_PROGRAM, CP_CONFIG_ID, a, b).publicKey).catch(() => null);
+        if (!cp) continue;
+        const p: any = CpmmPoolInfoLayout.decode(cp.data);
+        out.add((p.mintA.equals(mint) ? p.vaultA : p.vaultB).toBase58());
+        break;
+      }
+    }
+  }
+  return out;
+}
 /** A blockhash produced at least `minAhead` slots after the snapshot: unknown when the snapshot was taken, public afterwards, so a lottery seeded by it is unpredictable and verifiable. */
 async function seedAfter(conn: Connection, snapshotSlot: number, minAhead = 10): Promise<{ slot: number; blockhash: string }> {
   for (;;) {
@@ -370,10 +444,28 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
   const statePath = path.join(dir, `epoch-${epoch}.state.json`);
   const save = () => { if (!opts.dryRun) writeAtomic(statePath, JSON.stringify(state, null, 1)); };
   /** Persists a sink's payment the moment it is signed, before it is sent (see sendOnce). */
-  const keep = (st: SinkState) => (s: Sent) => { st.pending = s; save(); };
+  const keep = (st: { pending?: Sent }) => (s: Sent) => { st.pending = s; save(); };
   /** Send one transaction of sink `st`'s payment, exactly once. The caller records the signature and clears `st.pending` in one save. */
-  const pay = async (st: SinkState, ixs: TransactionInstruction[]) => { const sig = await sendOnce(conn, ixs, opts.operator!, keep(st), log); log(`  sent ${sig}`); return sig; };
+  const pay = async (st: { pending?: Sent }, ixs: TransactionInstruction[]) => { const sig = await sendOnce(conn, ixs, opts.operator!, keep(st), log); log(`  sent ${sig}`); return sig; };
   log(`[${token.symbol}] epoch ${epoch} ${opts.dryRun ? "DRY RUN" : "EXECUTE"} operator=${operatorPk.toBase58()}`);
+
+  // 0. the recipe stage (since 2026-10-05, src/stages.ts): checked once per epoch before anything moves and frozen in the state, so a resumed
+  // run works under the same sinks. A stage once reached is never left; on a change the carry file is re-keyed to the new sinks.
+  const launchSinks = token.sinks;
+  if (token.stages?.length) {
+    if (state.stage === undefined) {
+      const prior = readStage(dir)?.stage ?? 0;
+      const facts = await stageFactsOf(conn, token, mint, ledger, log);
+      const stage = nextStage(prior, token.stages, facts);
+      state.stage = stage; state.stageFacts = facts;
+      if (stage !== prior) {
+        log(`  recipe: stage ${stage} reached (${whenText(token.stages[stage - 1].when)}); the sinks change from here on`);
+        if (!opts.dryRun) { saveCarry(dir, rekeyCarry(loadCarry(dir), sinksAt(token, prior), sinksAt(token, stage), token)); writeStage(dir, { stage, reachedAt: new Date().toISOString(), facts }); }
+      } else if (!opts.dryRun) saveCarry(dir, absorbParked(loadCarry(dir), sinksAt(token, stage), token));
+      save();
+    }
+    if (state.stage > 0) { token = { ...token, sinks: sinksAt(token, state.stage) }; log(`  recipe: stage ${state.stage} (${whenText(token.stages![state.stage - 1].when)})`); }
+  }
 
   // 1. accounts, withheld, sweep
   const rows = await tokenAccounts(conn, token.mint, cfg.heliusRpc);
@@ -428,21 +520,79 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
   } else {
     // the snapshot is published first and the holder history advanced after it, so a crash in between can never count an epoch twice
     const at = Date.now(), balances = aggregateByOwner(rows, exclude);
+    // the creator's locked vesting allocation counts as held when the recipe says so (since 2026-10-05): it sits in the pool's vault, so it is
+    // added here and published on the creator's row as `vested`; when the creator claims, the wallet balance rises by what this falls
+    let vested: { owner: string; amount: bigint } | null = null;
+    const creator = token.registered?.creator;
+    if (token.vesting?.earns && creator && !exclude.has(creator)) {
+      const locked = await lockedUnclaimed(conn, token, mint, new PublicKey(creator)).catch((e) => { log(`  vesting: locked amount unreadable this epoch (${String((e as any)?.message ?? e).slice(0, 80)}); not counted`); return null; });
+      if (locked && locked > 0n) { vested = { owner: creator, amount: locked }; balances.set(creator, (balances.get(creator) ?? 0n) + locked); log(`  vesting: ${locked} ${token.symbol} locked for the creator count as held`); }
+    }
     holders = ledger.applySnapshot(balances, false, at);
     state.snapshot = { slot: await conn.getSlot("confirmed"), at: new Date(at).toISOString(),
-      holders: holders.map((h) => ({ owner: h.owner, amount: h.amount.toString(), epochsHeld: h.epochsHeld, everSold: h.everSold, lots: h.lots?.map((l) => [l.amount.toString(), l.since] as [string, number]) })) };
+      holders: holders.map((h) => ({ owner: h.owner, amount: h.amount.toString(), epochsHeld: h.epochsHeld, everSold: h.everSold, lots: h.lots?.map((l) => [l.amount.toString(), l.since] as [string, number]), ...(vested && h.owner === vested.owner ? { vested: vested.amount.toString() } : {}) })) };
     save();
     if (!opts.dryRun) ledger.applySnapshot(balances, true, at);
   }
   const snapshotAt = Date.parse(state.snapshot.at ?? state.startedAt);
   log(`  snapshot slot ${state.snapshot.slot}: ${state.snapshot.holders.length} holders`);
 
+  // 2b. buy-tax refunds (since 2026-10-05, src/refunds.ts): the tax on the epoch's buys goes back to the buyers, off the top, before the sinks
+  if (token.refund) {
+    const rf = state as EpochState & { refunds?: RefundState };
+    if (!rf.refunds) {
+      const hist = new Connection(cfg.heliusRpc || cfg.rpc, "confirmed");
+      const vaults = await vaultsOf(conn, token, mint);
+      const last = ledger.lastRecord();
+      const cursors: Record<string, string> = { ...(last?.refunds?.cursors ?? {}) };
+      // the window: after the last epoch's snapshot (or the registration), up to this epoch's snapshot; a buy after it is the next epoch's
+      const sinceMs = Date.parse(last?.snapshot?.at ?? last?.ranAt ?? token.registered?.at ?? state.startedAt) - 60_000;
+      const ignore = new Set<string>([...exclude, PLATFORM_FEE_WALLET, ...vaults]);
+      const buys: Buy[] = [];
+      for (const v of vaults) {
+        const sigs = (await signaturesSince(hist, new PublicKey(v), cursors[v], sinceMs)).filter((s) => s.slot <= state.snapshot!.slot);
+        if (sigs.length) { cursors[v] = sigs[sigs.length - 1].sig; buys.push(...(await buysOf(hist, sigs.map((s) => s.sig), token.mint, vaults, ignore, mintState.feeBps))); }
+      }
+      const balances = new Map(holders.map((h) => [h.owner, h.amount]));
+      const plan = planRefunds(buys, token.refund.mode, balances, mintState.feeBps, available);
+      rf.refunds = { mode: token.refund.mode, cursors, buys: buys.length, entries: plan.entries, fees: plan.fees.toString(), refunded: plan.refunded.toString(), forfeited: plan.forfeited.toString(), scaled: plan.scaled, sigs: [], done: plan.entries.length === 0 };
+      save();
+      log(`  refunds (${token.refund.mode}): ${buys.length} buys from ${vaults.size} vault(s), ${plan.entries.length} buyer(s) refunded ${plan.refunded} ${token.symbol} (tax ${plan.fees}, grossed up)${plan.forfeited > 0n ? `, ${plan.forfeited} forfeited by buyers who sold` : ""}${plan.scaled ? "; SCALED DOWN to what was swept" : ""}`);
+    }
+    const r = rf.refunds!;
+    if (!r.done) {
+      const ixs: TransactionInstruction[] = [];
+      for (const e of r.entries) {
+        const dest = new PublicKey(e.owner), ata = getAssociatedTokenAddressSync(mint, dest, true, TOKEN_2022_PROGRAM_ID);
+        ixs.push(createAssociatedTokenAccountIdempotentInstruction(operatorPk, ata, dest, mint, TOKEN_2022_PROGRAM_ID),
+          createTransferCheckedInstruction(operatorTokenAta, mint, ata, operatorPk, BigInt(e.refund), token.decimals, [], TOKEN_2022_PROGRAM_ID));
+      }
+      const perTx = 12, batches = Math.ceil(ixs.length / perTx);
+      if (!opts.dryRun) {
+        const earlier = await landed(conn, r.pending, log);
+        if (earlier) { r.sigs.push(earlier); r.paidBatches = (r.paidBatches ?? 0) + 1; }
+        r.pending = undefined; save();
+        for (let b = r.paidBatches ?? 0; b < batches; b++) {
+          const sig = await pay(r, ixs.slice(b * perTx, (b + 1) * perTx));
+          r.sigs.push(sig); r.paidBatches = b + 1; r.pending = undefined; save();
+        }
+      }
+      r.done = true; save();
+    }
+    available -= BigInt(r.refunded);
+    if (available < 0n) available = 0n;
+    log(`  available for sinks after refunds: ${available}`);
+  }
+
   // 3. pots: every sink's share of the tax swept since the last epoch, plus what that sink itself kept then (src/plan.ts)
   const ep: EpochState = state;
   if (ep.sinks.length === 0) {
     const last = ledger.lastRecord();
     if (!last && ledger.lastEpoch() > 0) log(`  note: the last epoch's record cannot be read; the pots are formed without what the sinks kept then`);
-    const formed = formPots(available, token.sinks.map((s) => s.share), keptBySink(last, token.sinks.length));
+    // kept pots belong to sinks by index; after a change of recipe the indices mean other sinks, so what the old sinks kept is simply fresh tax now
+    const sameRecipe = (last?.stage ?? 0) === (state.stage ?? 0);
+    if (last && !sameRecipe) log(`  the recipe changed since the last epoch: what its sinks kept joins the new sinks' pots by share`);
+    const formed = formPots(available, token.sinks.map((s) => s.share), sameRecipe ? keptBySink(last, token.sinks.length) : []);
     formed.forEach((f, i) => {
       ep.sinks[i] = { done: false, pot: f.pot.toString(), keptIn: f.keptIn > 0n ? f.keptIn.toString() : undefined, sigs: [] };
       if (f.keptIn > 0n) log(`  sink ${i} ${token.sinks[i].type}: ${f.keptIn} ${token.symbol} it kept in the last epoch stay with it`);
@@ -470,13 +620,15 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
         st.minAmount = minAmount.toString(); st.tokenPriceUsd = tokenUsd ?? undefined; save();
       }
     }
-    minimums.set(i, { minAmount, tokenUsd, eligible: holders.filter((h) => h.amount >= minAmount && h.amount > 0n && !exclude.has(h.owner)).length });
+    // under a minimum holding age only the lots old enough count (src/rules.ts agedHolder), for eligibility as for the split
+    const minAgeMs = sink.minAgeHours ? sink.minAgeHours * 3_600_000 : undefined;
+    minimums.set(i, { minAmount, tokenUsd, eligible: holders.map((h) => agedHolder(h, minAgeMs, snapshotAt)).filter((h) => h.amount >= minAmount && h.amount > 0n && !exclude.has(h.owner)).length });
   }
 
   // 5. conversions: every payout asset is bought with ONE swap per epoch, shared by the sinks that pay in it (src/plan.ts).
-  // Per sink: its part of what its asset's swap delivered; null = Jupiter has no route, the pot is kept.
+  // Per sink: its part of what its asset's swap delivered; null = Jupiter has no route, the pot is kept. A jackpot between draws converts nothing.
   const skip = new Set<number>();
-  token.sinks.forEach((s, i) => { if (ep.sinks[i].done || (s.type === "reflections" && minimums.get(i)?.eligible === 0)) skip.add(i); });
+  token.sinks.forEach((s, i) => { if (ep.sinks[i].done || (s.type === "reflections" && minimums.get(i)?.eligible === 0) || jackpotWaiting(s, epoch)) skip.add(i); });
   const parts = await runConversions({ token, state: ep, skip, save, log, dryRun: opts.dryRun,
     convert: (amount, outMint, progress) => convert(conn, token, cfg, amount, outMint, opts, progress, save, log) });
   /** A sink's part of its asset's swap. A sink no swap was planned for converts on its own, as every sink did until 2026-09-29. */
@@ -495,7 +647,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
   };
   /** Why sink i got no part of a swap: its asset's swap was too small this epoch, or Jupiter had no route. */
   const keptWhy = (i: number): KeptWhy => ep.sinks[i].keptWhy ?? (ep.conversions?.find((c) => c.sinks.includes(i))?.tooSmall !== undefined ? "too small" : "no route");
-  const keptText = (why: KeptWhy, outMint: string) => (why === "too small" ? "too small to swap yet" : `no route to ${outMint.slice(0, 6)}…`);
+  const keptText = (why: KeptWhy, outMint: string) => (why === "too small" ? "too small to swap yet" : why === "accruing" ? "jackpot accruing" : `no route to ${outMint.slice(0, 6)}…`);
 
   // 6. sinks
   const records: unknown[] = [];
@@ -512,7 +664,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
         pot: st.kept ? "0" : (BigInt(st.converted ?? pot.toString()) + BigInt(st.carriedIn ?? "0")).toString(), paid: (st.payList ?? st.allocations)?.length ?? 0,
         redistributed: st.redistributed, minAmount: st.minAmount, minUsd: sink.minUsd, tokenPriceUsd: st.tokenPriceUsd,
         entries: (st.payList ?? st.allocations ?? []).map(([owner, amount]) => ({ owner, amount })), allocations: st.allocations?.map(([owner, amount]) => ({ owner, amount })),
-        lottery: st.lottery, carriedIn: st.carriedIn, remainder: st.remainder, root: st.root, kept: st.kept, keptWhy: why, keptIn: st.keptIn, resumed: true, sigs: st.sigs });
+        lottery: st.lottery, carriedIn: st.carriedIn, remainder: st.remainder, root: st.root, kept: st.kept, keptWhy: why, drawAt: st.drawAt, keptIn: st.keptIn, resumed: true, sigs: st.sigs });
       else if (sink.type === "burn") records.push({ type: "burn", pot, asset: sink.asset && sink.asset !== "same" ? sink.asset : undefined, converted: st.converted, kept: st.kept, keptWhy: why, resumed: true, sigs: st.sigs });
       else { const pm = sinkPayoutMint(sink, token); records.push({ type: sink.type, wallet: sink.wallet, pot, asset: pm === token.mint ? "token" : pm === token.quoteMint ? "quote" : pm, payoutMint: pm, converted: st.converted, kept: st.kept, keptWhy: why, deferred: st.note?.startsWith("deferred") ? st.note.slice(9) : undefined, resumed: true, sigs: st.sigs }); }
       continue;
@@ -601,6 +753,15 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
     const { minAmount, tokenUsd, eligible: eligibleNow } = minimums.get(i)!;
     const payoutKey = sink.payoutMint === "same" ? token.mint : sink.payoutMint;
     let payoutMint = mint, payoutProgram = TOKEN_2022_PROGRAM_ID, payoutDecimals = token.decimals, payoutPot = pot;
+    const minAgeMs = sink.minAgeHours ? sink.minAgeHours * 3_600_000 : undefined;
+    // A jackpot between draws: nothing is converted, the pot stays with the sink and grows until the drawing epoch (since 2026-10-05).
+    if (jackpotWaiting(sink, epoch) && !st.converted && !st.allocations && !st.swapSig) {
+      const drawAt = nextDraw(sink, epoch);
+      log(`  reflections: jackpot accruing, draws at epoch ${drawAt}; ${pot} ${token.symbol} kept with the sink`);
+      st.note = `jackpot accruing; draws at epoch ${drawAt}`; st.kept = pot.toString(); st.keptWhy = "accruing"; st.drawAt = drawAt; st.done = true; save();
+      records.push({ type: "reflections", mode: sink.distribution, rule: sink.rule, payoutMint: payoutKey, pot: "0", paid: 0, entries: [], kept: pot, keptWhy: "accruing", drawAt, sigs: [] });
+      continue;
+    }
     // Nobody eligible (e.g. the only holder is a sink wallet): do not convert; the tokens stay with the operator and flow into the next epoch's total.
     if (eligibleNow === 0 && !st.converted && !st.allocations && !st.swapSig) {
       log(`  reflections: no eligible holder this epoch; ${pot} ${token.symbol} kept for the next epoch`);
@@ -627,7 +788,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       const carriedIn = BigInt(carry[`_pot:${i}`] ?? "0");
       const totalPot = payoutPot + carriedIn;
       if (sink.rule.type === "lottery" && !st.lottery) { st.lottery = await seedAfter(conn, state.snapshot!.slot); save(); log(`  lottery seed: blockhash ${st.lottery.blockhash} of slot ${st.lottery.slot} (snapshot slot ${state.snapshot!.slot})`); }
-      const alloc = allocate(sink.rule, holders, totalPot, { minAmount, exclude, seed: st.lottery?.blockhash ?? opts.seed ?? `${token.mint}:${epoch}`, at: snapshotAt });
+      const alloc = allocate(sink.rule, holders, totalPot, { minAmount, exclude, seed: st.lottery?.blockhash ?? opts.seed ?? `${token.mint}:${epoch}`, at: snapshotAt, minAgeMs });
       st.allocations = [...alloc.allocations.entries()].sort((a, b) => (b[1] > a[1] ? 1 : -1)).map(([o, a]) => [o, a.toString()]);
       st.carriedIn = carriedIn.toString(); st.remainder = alloc.remainder.toString();
       st.note = `rule=${sink.rule.type} eligible=${alloc.eligible} remainder=${alloc.remainder}${carriedIn ? ` carriedIn=${carriedIn}` : ""}`;
@@ -728,13 +889,18 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
   records.forEach((r, i) => { if (ep.sinks[i]?.keptIn && r && typeof r === "object") (r as { keptIn?: string }).keptIn = ep.sinks[i].keptIn; });
   // the record is written before the state is marked finished: a run that dies in between resumes, finds every sink done and writes the
   // same record again (the other order could leave a finished epoch with no record, and the next run would start the same number afresh)
+  const rf = state.refunds;
+  const refunds: RefundRecord | undefined = rf ? { mode: rf.mode, buys: rf.buys, buyers: rf.entries.length, fees: rf.fees, refunded: rf.refunded, forfeited: rf.forfeited, entries: rf.entries, cursors: rf.cursors, sigs: rf.sigs, ...(rf.scaled ? { scaled: true } : {}) } : undefined;
+  void launchSinks;
   const file = ledger.writeEpoch({
     epoch, ranAt: new Date().toISOString(), dryRun: opts.dryRun, mint: token.mint,
+    ...(state.stage !== undefined ? { stage: state.stage, stageFacts: state.stageFacts } : {}),
     tax: taxRecord(state, withheldRows.length, available, opts.dryRun),
+    ...(refunds ? { refunds } : {}),
     sinks: records,
     // the swaps of the epoch, one per payout asset: which sinks shared it, what went in and what came out (each sink's `converted` is its part)
     conversions: (ep.conversions ?? []).map((c) => ({ mint: c.mint, sinks: c.sinks, amount: c.amount, path: c.path, via: c.via?.converted ? { mint: c.via.mint, converted: c.via.converted } : undefined, converted: c.converted, kept: c.noRoute ? c.amount : undefined, tooSmall: c.tooSmall, sigs: c.sigs })),
-    signatures: [...new Set([...state.sweep.sigs, ...(ep.conversions ?? []).flatMap((c) => c.sigs), ...state.sinks.flatMap((s) => s.sigs)])],
+    signatures: [...new Set([...state.sweep.sigs, ...(rf?.sigs ?? []), ...(ep.conversions ?? []).flatMap((c) => c.sigs), ...state.sinks.flatMap((s) => s.sigs)])],
     snapshot: state.snapshot,
   });
   state.finished = true; save();

@@ -6,10 +6,15 @@ import type { Holder } from "./rules.js";
 /** A wallet's balance split by age, oldest first. `since` = the time (ms) of the snapshot that first saw these tokens. */
 export type StoredLot = { amount: string; since: number };
 export type HolderHistory = Record<string, { epochsHeld: number; everSold: boolean; lastAmount: string; lots?: StoredLot[] }>;
-/** A published snapshot row; `lots` as [amount, since ms] pairs, present since 2026-09-29. */
-export type SnapshotRow = { owner: string; amount: string; epochsHeld: number; everSold: boolean; lots?: [string, number][] };
+/** A published snapshot row; `lots` as [amount, since ms] pairs, present since 2026-09-29. `vested` (since 2026-10-05): the part of `amount`
+ *  that is the creator's locked, unclaimed vesting allocation, counted as held because the token's recipe says so. */
+export type SnapshotRow = { owner: string; amount: string; epochsHeld: number; everSold: boolean; lots?: [string, number][]; vested?: string };
 export type EpochRecord = {
   epoch: number; ranAt: string; dryRun: boolean; mint: string;
+  /** Since 2026-10-05: the recipe stage this epoch ran under (0 = the launch recipe) and what the stage check saw; absent = stage 0. */
+  stage?: number; stageFacts?: { graduated: boolean; holders: number | null; mcapUsd: number | null };
+  /** Since 2026-10-05: the buy-tax refunds of this epoch (src/refunds.ts), taken off the top before the sinks. */
+  refunds?: import("./refunds.js").RefundRecord;
   /** `withdrawn` = swept out of the mint by this epoch; `carried` = held by the operator from earlier epochs; `available` = both, what the sinks split.
    *  Records written before 2026-09-29 have neither `carried` nor `available`, and their `withdrawn` is the operator's whole balance. */
   tax: { withheldBefore: string; harvested: number; withdrawn: string; carried?: string; available?: string };

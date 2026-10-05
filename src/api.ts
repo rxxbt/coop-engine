@@ -17,9 +17,10 @@ import "dotenv/config";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, getTokenMetadata, getTransferFeeConfig, unpackMint } from "@solana/spl-token";
 import { LAUNCHPAD_PROGRAM, LaunchpadPool, getPdaLaunchpadPoolId } from "@raydium-io/raydium-sdk-v2";
-import { loadConfig, registryDir, sinkPayoutMint, type EngineConfig, type TokenConfig } from "./config.js";
+import { loadConfig, registryDir, sinkPayoutMint, sinksAt, type EngineConfig, type TokenConfig } from "./config.js";
 import { verifyManifest, saveToken, type Manifest } from "./registry.js";
 import { Ledger, type EpochRecord } from "./ledger.js";
+import { readStage } from "./stages.js";
 import { mintWithheld } from "./sweep.js";
 import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { verifyEpoch } from "./verify.js";
@@ -176,9 +177,14 @@ function publicToken(t: TokenConfig, dataDir: string) {
   const epochs = l.epochs();
   const last = epochs[epochs.length - 1];
   const qi = quotesNow()?.quotes.find((q) => q.mint === t.quoteMint);
+  // the dials of 2026-10-05: later recipes and the stage the token is in, buy-tax refunds, the vesting lock, the referral share
+  const stage = t.stages?.length ? readStage(path.join(dataDir, t.mint)) : null;
   return { mint: t.mint, symbol: t.symbol, quoteMint: t.quoteMint, quote: qi ? { symbol: qi.symbol, decimals: qi.decimals, logo: qi.logo ?? null } : null, decimals: t.decimals, epochHours: t.epochHours, sinks: t.sinks, exclusions: t.exclusions, registered: t.registered ?? null, hidden: !!t.hidden,
+    stages: t.stages ?? null, stage: stage?.stage ?? 0, stageReachedAt: stage?.reachedAt ?? null, refund: t.refund ?? null, vesting: t.vesting ?? null, referralBps: t.referralBps ?? 0,
     ledger: { epochs: epochs.length, lastRanAt: last?.ranAt ?? null, lastWithdrawn: last?.tax.withdrawn ?? null, unfinishedEpoch: l.unfinishedEpoch() } };
 }
+/** Every recipe a token can run: the launch sinks and each stage's. */
+const allSinks = (t: TokenConfig) => [t.sinks, ...(t.stages ?? []).map((s) => s.sinks)].flat();
 
 /** Token-2022 metadata lives in the mint itself (LaunchLab uses the metadata extension, not a Metaplex account); the URI's JSON adds description, image and links. */
 async function metadata(t: TokenConfig) {
@@ -258,7 +264,7 @@ async function tokenList(c: EngineConfig) {
       getQuotes(conn, c.dataDir).then((q) => q.quotes).catch(() => quotesNow()?.quotes ?? []),
     ]);
     const assets: Record<string, { symbol: string; decimals: number }> = {};
-    const wanted = new Set(list.flatMap((t) => [t.quoteMint, ...t.sinks.map((k) => sinkPayoutMint(k, t)).filter((m) => m !== t.mint)]));
+    const wanted = new Set(list.flatMap((t) => [t.quoteMint, ...allSinks(t).map((k) => sinkPayoutMint(k, t)).filter((m) => m !== t.mint)]));
     for (const m of wanted) {
       const q = menu.find((x) => x.mint === m);
       if (q) { assets[m] = { symbol: q.symbol, decimals: q.decimals }; continue; }
@@ -302,6 +308,9 @@ async function preview(t: TokenConfig, c: EngineConfig) {
     // the holding-time column uses the token's own dials when it has them, else the form's defaults (24 h, +0.10×, cap 3×)
     const own = t.sinks.flatMap((s) => (s.type === "reflections" && isAged(s.rule) ? [s.rule] : []))[0];
     const aged: AgedRule = own ?? { type: "time-weighted", intervalHours: 24, step: 0.1, cap: 3 };
+    // a minimum holding age set on the token's first holder sink applies to every column, as it would in an epoch
+    const minAgeHours = t.sinks.flatMap((s) => (s.type === "reflections" && s.minAgeHours ? [s.minAgeHours] : []))[0] ?? 0;
+    const minAgeMs = minAgeHours ? minAgeHours * 3_600_000 : undefined;
     const rules: { label: string; rule: Rule }[] = [
       { label: "pro-rata", rule: { type: "pro-rata" } },
       { label: `holding-time weighted, +${aged.step.toFixed(2)}× per ${aged.intervalHours} h, cap ${aged.cap.toFixed(2)}×`, rule: aged },
@@ -310,11 +319,11 @@ async function preview(t: TokenConfig, c: EngineConfig) {
     ];
     const pctOf = (a: bigint, of: bigint) => (of > 0n ? Number((a * 10000n) / of) / 100 : 0);
     return {
-      pot: pot.toString(), potLabel: "1 SOL", slot: context.slot, seed: value.blockhash, holderCount: holders.length, supply: supply.toString(),
+      pot: pot.toString(), potLabel: "1 SOL", slot: context.slot, seed: value.blockhash, holderCount: holders.length, supply: supply.toString(), minAgeHours,
       // `multiplier` = the wallet's effective holding-time multiplier right now (its lots averaged by size)
       holders: holders.sort((a, b) => (b.amount > a.amount ? 1 : -1)).slice(0, 25).map((h) => ({ owner: h.owner, amount: h.amount.toString(), pct: pctOf(h.amount, supply), epochsHeld: h.epochsHeld, everSold: h.everSold,
         multiplier: h.amount > 0n ? Number((agedWeight(aged, h, at) * 100n) / h.amount) / 10000 : 1 })),
-      rules: rules.map(({ label, rule }) => { const a = allocate(rule, holders, pot, { seed: value.blockhash, at }); return { label, type: rule.type, eligible: a.eligible, allocations: [...a.allocations.entries()].sort((x, y) => (y[1] > x[1] ? 1 : -1)).slice(0, 25).map(([owner, amount]) => ({ owner, amount: amount.toString(), pct: pctOf(amount, pot) })) }; }),
+      rules: rules.map(({ label, rule }) => { const a = allocate(rule, holders, pot, { seed: value.blockhash, at, minAgeMs }); return { label, type: rule.type, eligible: a.eligible, allocations: [...a.allocations.entries()].sort((x, y) => (y[1] > x[1] ? 1 : -1)).slice(0, 25).map(([owner, amount]) => ({ owner, amount: amount.toString(), pct: pctOf(amount, pot) })) }; }),
     };
   });
 }
@@ -391,7 +400,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     const [fee, meta] = await Promise.all([mintWithheld(conn, new PublicKey(t.mint)).catch(() => null), metadata(t)]);
     const assets: Record<string, { symbol: string; decimals: number }> = {};
     try {
-      const wanted = [t.quoteMint, ...t.sinks.map((k) => sinkPayoutMint(k, t)).filter((m) => m !== t.mint)]; // the quote plus every sink's payout asset
+      const wanted = [t.quoteMint, ...allSinks(t).map((k) => sinkPayoutMint(k, t)).filter((m) => m !== t.mint)]; // the quote plus every sink's payout asset, every stage's
       const menu = (await getQuotes(conn, c.dataDir)).quotes;
       for (const m of new Set(wanted)) {
         const q = menu.find((x) => x.mint === m);
@@ -402,7 +411,8 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     } catch { /* names are a nicety; the page falls back to short mints */ }
     return json(res, 200, { ...publicToken(t, c.dataDir), engine: ENGINE_ID, metadata: meta, assets, tax: fee ? { bps: fee.feeBps, withheldNow: fee.withheld.toString(), authority: fee.withdrawAuthority } : null, poolFees: poolFeesOf(c.dataDir, t.mint),
       epochs: l.epochs().map((e) => ({ epoch: e.epoch, ranAt: e.ranAt, withdrawn: e.tax.withdrawn, ...sweptOf(e), signatures: e.signatures, snapshotSlot: e.snapshot?.slot ?? null, holders: e.snapshot?.holders.length ?? null, verified: verifyEpoch(e, t).ok,
-        sinks: (e.sinks as any[]).map((s) => ({ type: s.type, mode: s.mode, rule: s.rule?.type, payoutMint: s.payoutMint, wallet: s.wallet, asset: s.asset, pot: s.pot, converted: s.converted, paid: s.paid, deferred: s.deferred, entries: s.entries?.length, paidAmount: Array.isArray(s.entries) ? s.entries.reduce((a: bigint, e: any) => a + BigInt(e.amount ?? 0), 0n).toString() : undefined, root: s.root, resumed: s.resumed, patched: s.patched, kept: s.kept, keptWhy: s.keptWhy, keptIn: s.keptIn, lottery: s.lottery })) })) });
+        stage: e.stage ?? 0, refunds: e.refunds ? { mode: e.refunds.mode, buys: e.refunds.buys, buyers: e.refunds.buyers, fees: e.refunds.fees, refunded: e.refunds.refunded, forfeited: e.refunds.forfeited, scaled: e.refunds.scaled } : undefined,
+        sinks: (e.sinks as any[]).map((s) => ({ type: s.type, mode: s.mode, rule: s.rule?.type, payoutMint: s.payoutMint, wallet: s.wallet, asset: s.asset, pot: s.pot, converted: s.converted, paid: s.paid, deferred: s.deferred, entries: s.entries?.length, paidAmount: Array.isArray(s.entries) ? s.entries.reduce((a: bigint, e: any) => a + BigInt(e.amount ?? 0), 0n).toString() : undefined, root: s.root, resumed: s.resumed, patched: s.patched, kept: s.kept, keptWhy: s.keptWhy, drawAt: s.drawAt, keptIn: s.keptIn, lottery: s.lottery })) })) });
   }
   if (req.method === "POST" && parts.length === 1 && (parts[0] === "upload" || parts[0] === "register")) {
     // uploads and registrations count apart (10 each per IP per 10 minutes): a dev who retried a few launches, an upload each, must still be
@@ -420,13 +430,15 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     // signature beside it, unsigned: it is a pointer for the record, the pool itself was verified above
     if (token.registered && !token.registered.launchSig && typeof body.launchSig === "string" && /^[1-9A-HJ-NP-Za-km-z]{60,120}$/.test(body.launchSig)) token.registered.launchSig = body.launchSig;
     if (c.tokens.some((x) => x.mint === token.mint)) throw new HttpError(409, "this mint is already registered");
+    // the same checks for every recipe the token can run: the launch sinks and each later stage's (since 2026-10-05)
+    const every = allSinks(token);
     // minimum holding is a dollar amount ; floor $2, so dust wallets are never in the snapshot
-    for (const s of token.sinks) if (s.type === "reflections" && !(typeof s.minUsd === "number" && s.minUsd >= 2)) throw new HttpError(400, "every reflections sink needs a minimum holding of at least $2 (minUsd)");
+    for (const s of every) if (s.type === "reflections" && !(typeof s.minUsd === "number" && s.minUsd >= 2)) throw new HttpError(400, "every reflections sink needs a minimum holding of at least $2 (minUsd)");
     // SOL has no burn instruction; a burn sink buys and burns a token, or burns the launched token itself
-    for (const s of token.sinks) if (s.type === "burn" && s.asset === "So11111111111111111111111111111111111111112") throw new HttpError(400, "a burn sink cannot burn SOL; pick a token to buy and burn, or burn the token itself");
+    for (const s of every) if (s.type === "burn" && s.asset === "So11111111111111111111111111111111111111112") throw new HttpError(400, "a burn sink cannot burn SOL; pick a token to buy and burn, or burn the token itself");
     // every payout asset must be buyable: the engine converts directly or through SOL, so Jupiter has to route SOL → asset. Only a clear
     // "no route" refuses the registration; if Jupiter cannot be asked right now the registration goes through (the form checked too).
-    for (const s of token.sinks) {
+    for (const s of every) {
       const asset = sinkPayoutMint(s, token);
       if (asset === token.mint || asset === token.quoteMint || asset === "So11111111111111111111111111111111111111112") continue;
       try { await jupQuote("So11111111111111111111111111111111111111112", asset, 10_000_000n, 100); }
