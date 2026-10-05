@@ -5,7 +5,7 @@ import { planConversions, splitDelivered } from "../src/plan.js";
 import type { Sink } from "../src/config.js";
 
 const TOKEN = "AUEsCrSHz21WmibhBm9UN3Ka7yRxMnxsBcS9Df5uaMfS", SOL = "So11111111111111111111111111111111111111112";
-const COOP = "DSZSngBU2VpMKCQSqMJkS3YvT5jYn2EbKWppZY6rZWmk", NVDAX = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh";
+const COOP = "2Pk5wVPa8jTm9m9QuNuqFDG98bZB4QJAX49iHu6vetM8", NVDAX = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh";
 const W = "FUBpgovMNbAJ62J18RSpJ7ZsFSfF1Ti5exAFSDV6BrSH";
 const refl = (share: number, payoutMint: string, rule: unknown = { type: "pro-rata" }): Sink => ({ type: "reflections", share, payoutMint, rule: rule as any, minUsd: 10, distribution: "push" });
 const token = (sinks: Sink[], quoteMint = SOL) => ({ mint: TOKEN, quoteMint, sinks });
@@ -178,7 +178,7 @@ test("epoch: a pot too small to swap keeps the pots of every sink in that asset,
   assert.equal(state.conversions![0].tooSmall, undefined);
   // scripts/run-epochs.sh alerts on "has no route for <amount>": dust must never match it
   assert.equal(lines.some((l) => /has no route for [0-9]+ /.test(l)), false);
-  assert.ok(lines.some((l) => /500000 T → DSZSng… is too small to swap \(worth 342385 lamports, under the 2000000 a swap needs\); kept for the next epoch/.test(l)));
+  assert.ok(lines.some((l) => /500000 T → 2Pk5wV… is too small to swap \(worth 342385 lamports, under the 2000000 a swap needs\); kept for the next epoch/.test(l)));
   const again = await run(token(sinks), JSON.parse(JSON.stringify(state)), swapper());   // worth a swap now, but this epoch already decided
   assert.deepEqual([...again.parts.entries()], [[0, 500n], [1, null], [2, null]]);
 });

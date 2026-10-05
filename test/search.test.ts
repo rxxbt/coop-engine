@@ -11,7 +11,7 @@ test("a ticker or a name is asked in lower case, a leading $ and spaces are drop
 
 test("an address keeps its case: lower-cased, Jupiter finds nothing and every ecosystem page reads 'unknown to Jupiter'", () => {
   // lookups by address: RKLB, NOK, Bonk and COOP
-  for (const mint of ["RKLBnAXGqv31iZomqsuAWkQm1aqC7JwwvbCfzGdqAhz", "N7Q5fYX7YRnDQksfdBKnoUb3awm92n7QNAD35X3Rq1X", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "DSZSngBU2VpMKCQSqMJkS3YvT5jYn2EbKWppZY6rZWmk", "So11111111111111111111111111111111111111112"]) {
+  for (const mint of ["RKLBnAXGqv31iZomqsuAWkQm1aqC7JwwvbCfzGdqAhz", "N7Q5fYX7YRnDQksfdBKnoUb3awm92n7QNAD35X3Rq1X", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "2Pk5wVPa8jTm9m9QuNuqFDG98bZB4QJAX49iHu6vetM8", "So11111111111111111111111111111111111111112"]) {
     const t = searchTerms(` ${mint} `);
     assert.equal(t.ask, mint);
     assert.equal(t.key, mint);

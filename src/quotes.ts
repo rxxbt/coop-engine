@@ -141,7 +141,7 @@ async function announceNew(prev: QuoteList | null, cur: QuoteList, dataDir: stri
 
 const searchCache = new Map<string, { at: number; rows: AssetInfo[] }>();
 /** Tickers whose first search result is fixed: ticker (lower case) → mint. */
-const PINNED: Record<string, string> = { coop: "DSZSngBU2VpMKCQSqMJkS3YvT5jYn2EbKWppZY6rZWmk" };
+const PINNED: Record<string, string> = { coop: "2Pk5wVPa8jTm9m9QuNuqFDG98bZB4QJAX49iHu6vetM8" }; // COOP on its own launchpad since 2026-10-05 (the earlier COOP DSZSng… is retired)
 
 /** What to ask Jupiter, and what to rank and cache by. A ticker or a name is matched without regard to case. An ADDRESS is case-sensitive
  *  and goes to Jupiter exactly as given: in lower case it finds nothing. A lookup by address must therefore never be
