@@ -25,6 +25,7 @@ import { mintWithheld } from "./sweep.js";
 import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { verifyEpoch } from "./verify.js";
 import { getQuotes, searchAssets, quotesNow } from "./quotes.js";
+import { countStats } from "./stats.js";
 import { quote as jupQuote } from "./jupiter.js";
 import { agedWeight, allocate, isAged, type AgedRule } from "./rules.js";
 import type { Rule } from "./config.js";
@@ -355,6 +356,11 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     return fs.createReadStream(f).pipe(res);
   }
   if (req.method === "GET" && parts.length === 1 && parts[0] === "quotes") return json(res, 200, await getQuotes(conn, cfg().dataDir), 300);
+  if (req.method === "GET" && parts.length === 1 && parts[0] === "stats") {
+    // the landing page's counters (tokens launched, creator wallets, epochs published, pairs on the menu); 5 min cache, static fallback in the page
+    const c = cfg();
+    return json(res, 200, await cached("stats", 5 * 60_000, async () => countStats(c, (quotesNow() ?? (await getQuotes(conn, c.dataDir))).count)), 300);
+  }
   if (req.method === "GET" && (parts[0] === "communities" || parts[0] === "community")) {
     // curated profiles behind the ecosystem pages: engine/communities.json, edited by hand when a community joins
     let profiles: any[] = [];
