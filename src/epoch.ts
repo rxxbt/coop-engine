@@ -19,7 +19,8 @@ import { withheldOf, harvestInstructions, mintWithheld, withdrawFromMintInstruct
 import { allocate, agedHolder, type Holder } from "./rules.js";
 import { NoRouteError, TooSmallError, formPots, keptBySink, runConversions, shareOf, type ConversionProgress, type ConversionState } from "./plan.js";
 import { balanceTree, toHex } from "./merkle.js";
-import { quote, swapTransaction } from "./jupiter.js";
+import { quote, swapTransaction, jupPrices } from "./jupiter.js";
+export { jupPrices } from "./jupiter.js";
 import { LAUNCHPAD_PROGRAM, LaunchpadPool, LaunchpadVesting, getPdaLaunchpadPoolId, getPdaVestId, CREATE_CPMM_POOL_PROGRAM, CpmmPoolInfoLayout, getCpmmPdaPoolId } from "@raydium-io/raydium-sdk-v2";
 import { Ledger, type SnapshotRow } from "./ledger.js";
 import { absorbParked, nextStage, readStage, rekeyCarry, whenText, writeStage, type StageFacts } from "./stages.js";
@@ -51,16 +52,8 @@ function saveCarry(dir: string, c: Carry) { writeAtomic(path.join(dir, "carry.js
 /** Write through a temporary file and a rename, so a run that dies mid-write leaves the old file whole, never half of the new one. */
 function writeAtomic(file: string, data: string) { fs.writeFileSync(`${file}.tmp`, data); fs.renameSync(`${file}.tmp`, file); }
 /** Split native-SOL payouts into deliverable now vs deferred (recipient would end below the rent minimum). */
-const PRICE_API = process.env.JUP_PRICE_API || "https://lite-api.jup.ag/price/v3";
 /** A first payout to a wallet with no token account must be worth at least this much (and twice the account's rent) before the operator funds the account. */
 const MIN_FIRST_PAYOUT_USD = 1;
-export async function jupPrices(ids: string[]): Promise<Record<string, number>> {
-  const r = await fetch(`${PRICE_API}?ids=${ids.join(",")}`, { signal: AbortSignal.timeout(15_000) });
-  if (!r.ok) throw new Error(`price ${r.status}`);
-  const j: any = await r.json(); const out: Record<string, number> = {};
-  for (const id of ids) { const row = j?.[id] ?? j?.data?.[id]; const p = Number(row?.usdPrice ?? row?.price); if (p > 0) out[id] = p; }
-  return out;
-}
 /** Lamports per base unit of the payout mint plus SOL's dollar price, from Jupiter's price feed (null if it cannot be priced right now). */
 async function payoutValueInLamports(mint: string, decimals: number, log: (s: string) => void): Promise<{ lamportsPerUnit: number; solUsd: number } | null> {
   const SOL = "So11111111111111111111111111111111111111112";

@@ -13,7 +13,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { LAUNCHPAD_PROGRAM, LaunchpadConfig } from "@raydium-io/raydium-sdk-v2";
 
 const SOL = "So11111111111111111111111111111111111111112";
-const TOKENS_API = process.env.JUP_TOKENS_API || "https://lite-api.jup.ag/tokens/v2";
+import { jupFetch, TOKENS_API } from "./jupiter.js";
 const TTL_MS = 60 * 60_000;
 
 export type QuoteGroup = "solana" | "stable" | "lst" | "stocks" | "commodities" | "leverage" | "other";
@@ -35,7 +35,7 @@ type JupToken = { id: string; symbol?: string; name?: string; icon?: string; dec
 
 /** Jupiter token search: a symbol, a name, or up to 100 comma-separated mints. */
 async function jupSearch(query: string): Promise<JupToken[]> {
-  const r = await fetch(`${TOKENS_API}/search?query=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(20_000) });
+  const r = await jupFetch(`${TOKENS_API}/search?query=${encodeURIComponent(query)}`);
   if (!r.ok) throw new Error(`jupiter tokens ${r.status}: ${(await r.text()).slice(0, 120)}`);
   const j = await r.json();
   return Array.isArray(j) ? j : [];

@@ -5,6 +5,8 @@ import { loadConfig } from "./config.js";
 import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { withheldOf, mintWithheld } from "./sweep.js";
 import { runEpoch } from "./epoch.js";
+import { primePrices } from "./jupiter.js";
+import { sinkPayoutMint } from "./config.js";
 import { Ledger } from "./ledger.js";
 import { verifyEpoch } from "./verify.js";
 import { runFees } from "./fees.js";
@@ -38,6 +40,8 @@ if (cmd === "tokens") {
 }
 
 if (cmd === "epoch" && arg === "--all") {
+  // one or two price requests for the whole run instead of two per token: every token's mint, quote and payout assets go into the cache first
+  await primePrices(["So11111111111111111111111111111111111111112", ...cfg.tokens.flatMap((t) => [t.mint, t.quoteMint, ...[...t.sinks, ...(t.stages ?? []).flatMap((st: any) => st.sinks ?? [])].map((s) => sinkPayoutMint(s, t))])]);
   // Scheduler for cron: run every token whose interval has elapsed (or whose last execute run crashed), one after another.
   const operator = loadOperator();
   let failed = 0, ran = 0;
