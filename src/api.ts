@@ -26,6 +26,7 @@ import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { verifyEpoch } from "./verify.js";
 import { getQuotes, searchAssets, quotesNow } from "./quotes.js";
 import { countStats } from "./stats.js";
+import { Logos, MIME } from "./logos.js";
 import { quote as jupQuote } from "./jupiter.js";
 import { agedWeight, allocate, isAged, type AgedRule } from "./rules.js";
 import type { Rule } from "./config.js";
@@ -36,6 +37,7 @@ const PUBLIC_BASE = (process.env.PUBLIC_BASE || `http://127.0.0.1:${PORT}`).repl
 const SITE_BASE = (process.env.SITE_BASE || "http://127.0.0.1:5173").replace(/\/$/, "");
 const ORIGINS = (process.env.CORS_ORIGINS || "http://127.0.0.1:5173,http://localhost:5173").split(",").map((s) => s.trim());
 const STORE = process.env.STORE_DIR || "store";
+const logos = new Logos(STORE); // token and pair logos served from here (GET /logo/<mint>.<ext>), see src/logos.ts
 /** Pool fees forwarded since graduation (src/fees.ts writes data/<mint>/fees.json), published per token as the docs promise. */
 function poolFeesOf(dataDir: string, mint: string): { toDev: Record<string, string>; count: number; records: unknown[] } | undefined {
   let recs: any[];
@@ -88,10 +90,16 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
   });
 }
 const cache = new Map<string, { at: number; data: unknown }>();
+const inflight = new Map<string, Promise<unknown>>();
+/** Fresh within the TTL; past it the stale value is answered at once and one refresh runs in the background (since 2026-10-12: a visitor
+ *  never waits on a cold rebuild of the token list, which can take seconds when metadata or asset lookups are slow). */
 async function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
   const c = cache.get(key);
   if (c && Date.now() - c.at < ttlMs) return c.data as T;
-  const data = await fn(); cache.set(key, { at: Date.now(), data }); return data;
+  let p = inflight.get(key) as Promise<T> | undefined;
+  if (!p) { p = fn().then((data) => { cache.set(key, { at: Date.now(), data }); return data; }).finally(() => inflight.delete(key)); inflight.set(key, p); }
+  if (c) { p.catch(() => { /* the stale value stands until a refresh succeeds */ }); return c.data as T; }
+  return p;
 }
 
 const MAGIC: [string, string, (b: Buffer) => boolean][] = [
@@ -180,7 +188,7 @@ function publicToken(t: TokenConfig, dataDir: string) {
   const qi = quotesNow()?.quotes.find((q) => q.mint === t.quoteMint);
   // the dials of 2026-10-05: later recipes and the stage the token is in, buy-tax refunds, the vesting lock, the referral share
   const stage = t.stages?.length ? readStage(path.join(dataDir, t.mint)) : null;
-  return { mint: t.mint, symbol: t.symbol, quoteMint: t.quoteMint, quote: qi ? { symbol: qi.symbol, decimals: qi.decimals, logo: qi.logo ?? null } : null, decimals: t.decimals, epochHours: t.epochHours, sinks: t.sinks, exclusions: t.exclusions, registered: t.registered ?? null, hidden: !!t.hidden,
+  return { mint: t.mint, symbol: t.symbol, quoteMint: t.quoteMint, quote: qi ? { symbol: qi.symbol, decimals: qi.decimals, logo: logos.url(PUBLIC_BASE, t.quoteMint, qi.logo) } : null, decimals: t.decimals, epochHours: t.epochHours, sinks: t.sinks, exclusions: t.exclusions, registered: t.registered ?? null, hidden: !!t.hidden,
     stages: t.stages ?? null, stage: stage?.stage ?? 0, stageReachedAt: stage?.reachedAt ?? null, refund: t.refund ?? null, vesting: t.vesting ?? null, referralBps: t.referralBps ?? 0,
     ledger: { epochs: epochs.length, lastRanAt: last?.ranAt ?? null, lastWithdrawn: last?.tax.withdrawn ?? null, unfinishedEpoch: l.unfinishedEpoch() } };
 }
@@ -276,7 +284,7 @@ async function tokenList(c: EngineConfig) {
       const m = metas[i], info = pools[i];
       let curve: ReturnType<typeof curveState> | null = null;
       try { curve = info ? curveState(t, info.data) : null; } catch { /* a pool that does not decode is shown without numbers */ }
-      return { ...publicToken(t, c.dataDir), name: m?.name ?? null, image: m?.image ?? null, description: m?.description ?? null, taxBps: t.registered?.feeBps ?? null,
+      return { ...publicToken(t, c.dataDir), name: m?.name ?? null, image: logos.url(PUBLIC_BASE, t.mint, m?.image), description: m?.description ?? null, taxBps: t.registered?.feeBps ?? null,
         curve: curve ? { status: curve.status, progressPct: curve.progressPct, priceUsd: curve.priceUsd, mcapUsd: curve.mcapUsd, liquidityUsd: curve.liquidityUsd } : null };
     }).sort((a, b) => (b.registered?.at ?? "").localeCompare(a.registered?.at ?? ""));
     return { tokens, assets };
@@ -355,6 +363,22 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     res.writeHead(200, { "content-type": type, "cache-control": "public, max-age=31536000, immutable" });
     return fs.createReadStream(f).pipe(res);
   }
+  if (req.method === "GET" && parts.length === 2 && parts[0] === "logo") {
+    // a token's or a pair's logo from our own store: fetched once from its source, then served for a year (the CDN keeps it too)
+    const m = parts[1].match(/^([1-9A-HJ-NP-Za-km-z]{32,44})\.(png|jpg|gif|webp|svg)$/);
+    if (!m) throw new HttpError(404, "not found");
+    const [, mint, ext] = m;
+    let have = logos.ext(mint);
+    if (!have) {
+      const c = cfg(); const t = c.tokens.find((x) => x.mint === mint);
+      const src = t ? (await metadata(t).catch(() => null))?.image : (quotesNow()?.quotes.find((q) => q.mint === mint)?.logo ?? (await searchAssets(mint).catch(() => []))[0]?.logo);
+      have = (src && (await logos.fetch(mint, src))) || undefined;
+    }
+    if (!have) throw new HttpError(404, "no logo for this mint");
+    if (have !== ext) { res.writeHead(302, { location: `/logo/${mint}.${have}`, "cache-control": "public, max-age=300" }); return res.end(); }
+    res.writeHead(200, { "content-type": MIME[have], "cache-control": "public, max-age=31536000, immutable" });
+    return fs.createReadStream(logos.file(mint, have)).pipe(res);
+  }
   if (req.method === "GET" && parts.length === 1 && parts[0] === "quotes") return json(res, 200, await getQuotes(conn, cfg().dataDir), 300);
   if (req.method === "GET" && parts.length === 1 && parts[0] === "stats") {
     // the landing page's counters (tokens launched, creator wallets, epochs published, pairs on the menu); 5 min cache, static fallback in the page
@@ -415,7 +439,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
         if (hit && hit.mint === m) assets[m] = { symbol: hit.symbol, decimals: hit.decimals };
       }
     } catch { /* names are a nicety; the page falls back to short mints */ }
-    return json(res, 200, { ...publicToken(t, c.dataDir), engine: ENGINE_ID, metadata: meta, assets, tax: fee ? { bps: fee.feeBps, withheldNow: fee.withheld.toString(), authority: fee.withdrawAuthority } : null, poolFees: poolFeesOf(c.dataDir, t.mint),
+    return json(res, 200, { ...publicToken(t, c.dataDir), engine: ENGINE_ID, metadata: meta ? { ...meta, image: logos.url(PUBLIC_BASE, t.mint, meta.image) } : meta, assets, tax: fee ? { bps: fee.feeBps, withheldNow: fee.withheld.toString(), authority: fee.withdrawAuthority } : null, poolFees: poolFeesOf(c.dataDir, t.mint),
       epochs: l.epochs().map((e) => ({ epoch: e.epoch, ranAt: e.ranAt, withdrawn: e.tax.withdrawn, ...sweptOf(e), signatures: e.signatures, snapshotSlot: e.snapshot?.slot ?? null, holders: e.snapshot?.holders.length ?? null, verified: verifyEpoch(e, t).ok,
         stage: e.stage ?? 0, refunds: e.refunds ? { mode: e.refunds.mode, buys: e.refunds.buys, buyers: e.refunds.buyers, fees: e.refunds.fees, refunded: e.refunds.refunded, forfeited: e.refunds.forfeited, scaled: e.refunds.scaled } : undefined,
         sinks: (e.sinks as any[]).map((s) => ({ type: s.type, mode: s.mode, rule: s.rule?.type, payoutMint: s.payoutMint, wallet: s.wallet, asset: s.asset, pot: s.pot, converted: s.converted, paid: s.paid, deferred: s.deferred, entries: s.entries?.length, paidAmount: Array.isArray(s.entries) ? s.entries.reduce((a: bigint, e: any) => a + BigInt(e.amount ?? 0), 0n).toString() : undefined, root: s.root, resumed: s.resumed, patched: s.patched, kept: s.kept, keptWhy: s.keptWhy, drawAt: s.drawAt, keptIn: s.keptIn, lottery: s.lottery })) })) });
@@ -457,6 +481,23 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   }
   throw new HttpError(404, "not found");
 }
+
+/** Keep the token list, the metadata behind it and every logo warm, so the first visitor after a quiet spell gets the fast path too. */
+let warming = false;
+async function prewarm() {
+  if (warming) return; warming = true;
+  try {
+    const c = cfg();
+    const list = (await tokenList(c)).tokens as any[];
+    const items: { mint: string; src: string | null | undefined }[] = [];
+    for (const t of c.tokens.filter((x) => !x.hidden)) { const m = await metadata(t).catch(() => null); items.push({ mint: t.mint, src: m?.image }); }
+    for (const t of list) if (t.quote?.logo) items.push({ mint: t.quoteMint, src: t.quote.logo });
+    await logos.prime(items);
+  } catch (e: any) { log(`prewarm: ${String(e?.message ?? e).slice(0, 120)}`); }
+  finally { warming = false; }
+}
+setTimeout(() => { void prewarm(); }, 3_000);
+setInterval(() => { void prewarm(); }, 25_000);
 
 http.createServer(async (req, res) => {
   const origin = req.headers.origin;
