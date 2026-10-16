@@ -298,7 +298,8 @@ export async function sendAll(conn: Connection, ixs: TransactionInstruction[], p
 /** "Blockhash not found" from a send's preflight: the RPC node that simulated the transaction was behind the one that gave the blockhash.
  *  The transaction was refused before it was sent (2026-10-02: one test token's epoch failed on it, the only time since 2026-09-25). */
 export const isStaleBlockhash = (e: unknown) => /blockhash not found/i.test(String((e as any)?.message ?? e));
-export const isNoRoute = (e: unknown) => /no routes? found|NO_ROUTES_FOUND|could not find any route|CANNOT_COMPUTE_OTHER_AMOUNT_THRESHOLD|Cannot compute other amount threshold/i.test(String((e as any)?.message ?? e));
+// Since 2026-10-16 Jupiter also refuses a dead curve token outright (400 TOKEN_NOT_TRADABLE, "The token … is not tradable"): nothing to swap either.
+export const isNoRoute = (e: unknown) => /no routes? found|NO_ROUTES_FOUND|could not find any route|CANNOT_COMPUTE_OTHER_AMOUNT_THRESHOLD|Cannot compute other amount threshold|TOKEN_NOT_TRADABLE|is not tradable/i.test(String((e as any)?.message ?? e));
 async function quoteOrNoRoute(...args: Parameters<typeof quote>) { try { return await quote(...args); } catch (e) { if (isNoRoute(e)) throw new NoRouteError(String((e as any)?.message ?? e)); throw e; } }
 
 /** Poll for confirmation instead of waiting on a WebSocket subscription; false once the blockhash expired without inclusion (then a re-send cannot double-execute). */
