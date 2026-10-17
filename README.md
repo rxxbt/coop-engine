@@ -77,7 +77,9 @@ npm test
 
 `scripts/run-epochs.sh` is the hourly entry point: it runs the scheduler and alerts the operator when an epoch fails,
 when a pot above dust could not be converted, or when the operator wallet runs low. `src/api.ts` serves the registry, the
-ledgers and the launch form's helpers.
+ledgers and the launch form's helpers. A launch's image and metadata are pinned to IPFS and kept by the API under their
+CIDs; the token's metadata address is the platform's own `/ipfs/<cid>` path, which serves only files the platform pinned
+(`src/files.ts`), so the files can move to other storage without changing any token.
 
 ## How it is operated
 
