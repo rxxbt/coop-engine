@@ -5,14 +5,13 @@
  * Plain node:http, no framework. Binds to 127.0.0.1 by default; Caddy (TLS) in front for the public.
  *
  *   npx tsx src/api.ts   # env: API_PORT, API_HOST, PUBLIC_BASE, SITE_BASE, CORS_ORIGINS, STORE_DIR, PLATFORM_IDS,
- *                        #      OPERATOR_PUBKEY (or OPERATOR_KEYPAIR), PINATA_JWT + IPFS_GATEWAY (optional; the platform's own dedicated gateway),
+ *                        #      OPERATOR_PUBKEY (or OPERATOR_KEYPAIR),
  *                        #      ALLOW_LOCAL_META=1 (dev only: allow uploads when PUBLIC_BASE is a local address), ENGINE_ID
  */
 import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import "dotenv/config";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, getTokenMetadata, getTransferFeeConfig, unpackMint } from "@solana/spl-token";
@@ -27,7 +26,7 @@ import { verifyEpoch } from "./verify.js";
 import { getQuotes, searchAssets, quotesNow } from "./quotes.js";
 import { countStats } from "./stats.js";
 import { Logos, MIME } from "./logos.js";
-import { CID, FileStore } from "./files.js";
+import { MetaJsonCache, NAMES, TYPES, keepFile, ownFile } from "./launchfiles.js";
 import { quote as jupQuote } from "./jupiter.js";
 import { agedWeight, allocate, isAged, type AgedRule } from "./rules.js";
 import type { Rule } from "./config.js";
@@ -39,9 +38,8 @@ const SITE_BASE = (process.env.SITE_BASE || "http://127.0.0.1:5173").replace(/\/
 const ORIGINS = (process.env.CORS_ORIGINS || "http://127.0.0.1:5173,http://localhost:5173").split(",").map((s) => s.trim());
 const STORE = process.env.STORE_DIR || "store";
 const logos = new Logos(STORE); // token and pair logos served from here (GET /logo/<mint>.<ext>), see src/logos.ts
-// a launch's image and metadata, kept under their CIDs and served at <PUBLIC_BASE>/ipfs/<cid> (since 2026-10-17, src/files.ts); only an
-// explicitly configured gateway is asked for a missing CID: the platform's own dedicated one, which serves its own account's files only
-const files = new FileStore(STORE, PUBLIC_BASE, process.env.IPFS_GATEWAY ? process.env.IPFS_GATEWAY.replace(/\/$/, "") : undefined);
+// every token's metadata JSON, read once per address and kept (since 2026-10-17, src/launchfiles.ts); a launch's own files live in STORE
+const metaJson = new MetaJsonCache(STORE, PUBLIC_BASE, { log: (s) => log(s) });
 /** Pool fees forwarded since graduation (src/fees.ts writes data/<mint>/fees.json), published per token as the docs promise. */
 function poolFeesOf(dataDir: string, mint: string): { toDev: Record<string, string>; count: number; records: unknown[] } | undefined {
   let recs: any[];
@@ -55,7 +53,6 @@ const PLATFORM_IDS = (process.env.PLATFORM_IDS || "DEfEVZNPRvQGCpKq19BQ5dpB2hmGV
 const OPERATOR = process.env.OPERATOR_PUBKEY || (process.env.OPERATOR_KEYPAIR && fs.existsSync(process.env.OPERATOR_KEYPAIR)
   ? new PublicKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.OPERATOR_KEYPAIR, "utf8"))).slice(32)).toBase58()
   : "9dZcuWdTRjStMFNpQGDsSUZvTBkhrGZXxFvNMkjbpYKv");
-const PINATA_JWT = process.env.PINATA_JWT;
 const ENGINE_ID = process.env.ENGINE_ID || os.hostname();
 const LOCAL_BASE = /^https?:\/\/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[::1\])/i.test(PUBLIC_BASE);
 const ALLOW_LOCAL_META = process.env.ALLOW_LOCAL_META === "1";
@@ -116,21 +113,6 @@ const str = (v: unknown, max: number, name: string, required = false) => {
   if (typeof v !== "string" || v.length > max) throw new HttpError(400, `${name} must be a string of at most ${max} characters`);
   return v.trim();
 };
-/** Pin a file to IPFS through Pinata. Tries the current Files API first (public network), then the legacy pinning API; returns the CID. */
-async function pinBytes(buf: Buffer, name: string, mime: string): Promise<string> {
-  const fd = new FormData();
-  fd.append("file", new Blob([Uint8Array.from(buf)], { type: mime }), name);
-  fd.append("network", "public");
-  const v3 = await fetch("https://uploads.pinata.cloud/v3/files", { method: "POST", headers: { authorization: `Bearer ${PINATA_JWT}` }, body: fd }).catch(() => null);
-  if (v3?.ok) { const j: any = await v3.json(); if (j?.data?.cid) return j.data.cid as string; }
-  const fd2 = new FormData();
-  fd2.append("file", new Blob([Uint8Array.from(buf)], { type: mime }), name);
-  const legacy = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", { method: "POST", headers: { authorization: `Bearer ${PINATA_JWT}` }, body: fd2 });
-  const j: any = await legacy.json().catch(() => ({}));
-  if (!legacy.ok || !j.IpfsHash) throw new HttpError(502, `pinning failed: files api ${v3?.status ?? "unreachable"}, legacy ${legacy.status} ${JSON.stringify(j).slice(0, 160)}`);
-  return j.IpfsHash as string;
-}
-
 /** Only http(s) URLs with a real host, no credentials; everything else is refused (a bad link is baked into the token forever). */
 function cleanUrl(v: string | undefined, name: string): string | undefined {
   if (!v) return undefined;
@@ -159,38 +141,16 @@ async function upload(body: any) {
   const kind = MAGIC.find(([mime, , test]) => mime === m[1] && test(buf));
   if (!kind) throw new HttpError(400, "image bytes do not match the declared type");
   const [mime, ext] = kind;
-  const id = createHash("sha256").update(buf).digest("hex").slice(0, 32);
-  // pinned to IPFS as before, kept here under the same CID, and the token gets COOP's own address for it (since 2026-10-17): the files
-  // can move to other storage later without breaking any token. Until then every launch wrote the gateway's own address (IPFS_GATEWAY).
-  let imageUrl: string, hosted = "coop server";
-  if (PINATA_JWT) {
-    const cid = await pinBytes(buf, `${id}.${ext}`, mime);
-    files.put(cid, buf);
-    imageUrl = files.url(cid); hosted = "coop + ipfs";
-  } else {
-    fs.mkdirSync(path.join(STORE, "img"), { recursive: true });
-    fs.writeFileSync(path.join(STORE, "img", `${id}.${ext}`), buf);
-    imageUrl = `${PUBLIC_BASE}/img/${id}.${ext}`;
-  }
+  // kept on COOP's own server under the hash of their bytes and served from its own address (since 2026-10-17, src/launchfiles.ts); the
+  // nightly backup copies them off the server. Until then every launch pinned both files to IPFS through Pinata and wrote the address
+  // of COOP's Pinata gateway into the token.
+  const imageUrl = `${PUBLIC_BASE}/img/${keepFile(STORE, "img", buf, ext)}`;
   const meta: Record<string, unknown> = { name, symbol, description, image: imageUrl, properties: { files: [{ uri: imageUrl, type: mime }], category: "image" } };
   if (website) meta.external_url = website;
   const ext2: Record<string, string> = {}; if (website) ext2.website = website; if (twitter) ext2.twitter = twitter; if (telegram) ext2.telegram = telegram;
   if (Object.keys(ext2).length) meta.extensions = ext2;
-  const text = JSON.stringify(meta, null, 1);
-  let uri: string;
-  if (PINATA_JWT) {
-    const metaBuf = Buffer.from(text, "utf8");
-    const cid = await pinBytes(metaBuf, `${symbol}-metadata.json`, "application/json");
-    files.put(cid, metaBuf);
-    uri = files.url(cid);
-  }
-  else {
-    const mid = createHash("sha256").update(text).digest("hex").slice(0, 32);
-    fs.mkdirSync(path.join(STORE, "meta"), { recursive: true });
-    fs.writeFileSync(path.join(STORE, "meta", `${mid}.json`), text);
-    uri = `${PUBLIC_BASE}/meta/${mid}.json`;
-  }
-  return { uri, image: imageUrl, hosted };
+  const uri = `${PUBLIC_BASE}/meta/${keepFile(STORE, "meta", Buffer.from(JSON.stringify(meta, null, 1), "utf8"), "json")}`;
+  return { uri, image: imageUrl, hosted: "coop server" };
 }
 
 function publicToken(t: TokenConfig, dataDir: string) {
@@ -212,15 +172,8 @@ async function metadata(t: TokenConfig) {
   return cached(`meta:${t.mint}`, 10 * 60_000, async () => {
     const tm = await getTokenMetadata(conn, new PublicKey(t.mint), "confirmed", TOKEN_2022_PROGRAM_ID).catch(() => null);
     if (!tm) return null;
-    let j: any = null;
-    if (/^https?:\/\//.test(tm.uri)) {
-      try {
-        // a token launched since 2026-10-17 points at our own /ipfs/ address: read from the store, not through the CDN and back
-        const own = await files.readOwn(tm.uri);
-        if (own) j = JSON.parse(own.toString("utf8"));
-        else { const r = await fetch(tm.uri, { signal: AbortSignal.timeout(6000) }); if (r.ok) j = await r.json(); }
-      } catch { /* unreachable or unreadable URI */ }
-    }
+    // read once per address and kept: the token's address never changes, and neither does what an IPFS or COOP address serves
+    const j: any = await metaJson.get(tm.uri);
     return { name: tm.name, symbol: tm.symbol, uri: tm.uri, uriLocal: /^https?:\/\/(localhost|127\.|10\.|192\.168\.)/.test(tm.uri),
       description: j?.description ?? null, image: j?.image ?? null, website: j?.external_url ?? j?.extensions?.website ?? null, twitter: j?.extensions?.twitter ?? null, telegram: j?.extensions?.telegram ?? null };
   });
@@ -360,7 +313,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url || "/", PUBLIC_BASE);
   const parts = url.pathname.split("/").filter(Boolean);
   const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.socket.remoteAddress || "?";
-  if (req.method === "GET" && parts.length === 1 && parts[0] === "health") return json(res, 200, { ok: true, engine: ENGINE_ID, local: LOCAL_BASE, operator: OPERATOR, platforms: PLATFORM_IDS, hosted: PINATA_JWT ? "coop + ipfs" : "coop server", publicBase: PUBLIC_BASE });
+  if (req.method === "GET" && parts.length === 1 && parts[0] === "health") return json(res, 200, { ok: true, engine: ENGINE_ID, local: LOCAL_BASE, operator: OPERATOR, platforms: PLATFORM_IDS, hosted: "coop server", publicBase: PUBLIC_BASE });
   if (req.method === "POST" && parts.length === 1 && parts[0] === "rpc") {
     // browsers always send Origin on this cross-origin POST; bots must at least know to fake it, and per-IP plus daily caps protect the upstream quota
     const origin = req.headers.origin;
@@ -374,25 +327,13 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     res.writeHead(up.status, { "content-type": "application/json" }); return res.end(text);
   }
   if (req.method === "GET" && (parts[0] === "img" || parts[0] === "meta") && parts.length === 2) {
-    if (!/^[a-f0-9]{32}\.(png|jpg|gif|webp|json)$/.test(parts[1])) throw new HttpError(404, "not found");
-    const f = path.join(STORE, parts[0], parts[1]);
-    if (!fs.existsSync(f)) throw new HttpError(404, "not found");
-    const ext = parts[1].split(".").pop()!;
-    const type = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp", json: "application/json" }[ext]!;
-    res.writeHead(200, { "content-type": type, "cache-control": "public, max-age=31536000, immutable" });
-    return fs.createReadStream(f).pipe(res);
-  }
-  if (req.method === "GET" && parts.length === 2 && parts[0] === "ipfs") {
-    // a launch's image or metadata at COOP's own address (src/files.ts): only files COOP pinned, never anyone else's; open to every app
-    const cid = parts[1];
-    if (!CID.test(cid)) throw new HttpError(404, "not found");
-    let f = files.find(cid);
-    if (!f) { if (limited(`ipfs:${ip}`, 30, 60_000)) throw new HttpError(429, "too many requests; slow down"); f = await files.get(cid); }
-    if (!f) throw new HttpError(404, "not found");
-    const headers = { "content-type": f.type, "cache-control": "public, max-age=31536000, immutable", etag: `"${cid}"`, "access-control-allow-origin": "*" };
+    // a launch's image or metadata (src/launchfiles.ts): named by the hash of their bytes, so they never change; open to every app
+    const f = ownFile(STORE, PUBLIC_BASE, `${PUBLIC_BASE}/${parts[0]}/${parts[1]}`);
+    if (!f || !NAMES[parts[0] as "img" | "meta"].test(parts[1])) throw new HttpError(404, "not found");
+    const headers = { "content-type": TYPES[parts[1].split(".").pop()!], "cache-control": "public, max-age=31536000, immutable", etag: `"${parts[1]}"`, "access-control-allow-origin": "*" };
     if (req.headers["if-none-match"] === headers.etag) { res.writeHead(304, headers); return res.end(); }
     res.writeHead(200, headers);
-    return fs.createReadStream(f.file).pipe(res);
+    return fs.createReadStream(f).pipe(res);
   }
   if (req.method === "GET" && parts.length === 2 && parts[0] === "logo") {
     // a token's or a pair's logo from our own store: fetched once from its source, then served for a year (the CDN keeps it too)
@@ -542,4 +483,4 @@ http.createServer(async (req, res) => {
     if (status === 500) log(`ERROR ${req.method} ${req.url}: ${e?.stack || e}`);
     json(res, status, { error: e?.message || "internal error" });
   }
-}).listen(PORT, HOST, () => log(`COOP api ${ENGINE_ID} listening on http://${HOST}:${PORT} (public base ${PUBLIC_BASE}${LOCAL_BASE ? " [LOCAL]" : ""}, store ${STORE}, hosting ${PINATA_JWT ? "coop + ipfs" : "local"}, operator ${OPERATOR})`));
+}).listen(PORT, HOST, () => log(`COOP api ${ENGINE_ID} listening on http://${HOST}:${PORT} (public base ${PUBLIC_BASE}${LOCAL_BASE ? " [LOCAL]" : ""}, store ${STORE}, files on its own address, operator ${OPERATOR})`));
