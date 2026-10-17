@@ -32,7 +32,7 @@ test("our own addresses map to kept files; other hosts, odd names and missing fi
 
 test("IPFS paths and our own files cannot change; any other address can", () => {
   assert.ok(immutableAddress(IPFS, BASE));
-  assert.ok(immutableAddress("https://purple.example.mypinata.cloud/ipfs/QmQr3Fz4h1etNsF7oLGMRHiCzhB5y9a7GjyodnF7zLHK1g", BASE));
+  assert.ok(immutableAddress("https://gateway.example/ipfs/QmQr3Fz4h1etNsF7oLGMRHiCzhB5y9a7GjyodnF7zLHK1g", BASE));
   assert.ok(immutableAddress(`${BASE}/meta/${"a".repeat(32)}.json`, BASE));
   assert.equal(immutableAddress("https://dev.example/token.json", BASE), false);
   assert.equal(immutableAddress("https://gw.example/ipfs/not-a-cid", BASE), false);
