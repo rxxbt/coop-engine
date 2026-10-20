@@ -300,6 +300,22 @@ export async function sendAll(conn: Connection, ixs: TransactionInstruction[], p
 export const isStaleBlockhash = (e: unknown) => /blockhash not found/i.test(String((e as any)?.message ?? e));
 // Since 2026-10-16 Jupiter also refuses a dead curve token outright (400 TOKEN_NOT_TRADABLE, "The token … is not tradable"): nothing to swap either.
 export const isNoRoute = (e: unknown) => /no routes? found|NO_ROUTES_FOUND|could not find any route|CANNOT_COMPUTE_OTHER_AMOUNT_THRESHOLD|Cannot compute other amount threshold|TOKEN_NOT_TRADABLE|is not tradable/i.test(String((e as any)?.message ?? e));
+/** What `amount` base units of a token are worth in lamports at a dollar price for the token and for SOL (pure; tested). */
+export function lamportsWorth(amount: bigint, decimals: number, tokenUsd: number, solUsd: number): bigint {
+  if (!(tokenUsd > 0) || !(solUsd > 0)) return 0n;
+  return BigInt(Math.floor((Number(amount) / 10 ** decimals) * (tokenUsd / solUsd) * 1e9));
+}
+/** A pot Jupiter cannot route at all, valued at the token's own price (Jupiter's feed, else the curve's reserves). Since October 2026
+ *  Jupiter drops a LaunchLab curve token from routing about three weeks after launch unless its curve is deep, so dead tokens' dust
+ *  piles up as "no route" and alerted every hour (2026-10-20: a dead token's 7,659-token pot worth $0.02). Under the swap floor it is dust like any pot
+ *  too small to swap: kept, no alert. At or above the floor, or when no price can be found, real money may be stuck: the no-route
+ *  error stands and alerts. */
+async function dustOrRethrow(conn: Connection, token: TokenConfig, amount: bigint, e: NoRouteError, log: (s: string) => void): Promise<never> {
+  const usd = await tokenPriceUsd(conn, token, log).catch(() => null);
+  const sol = usd ? (await jupPrices([SOL_MINT]).catch(() => ({} as Record<string, number>)))[SOL_MINT] : undefined;
+  if (usd && sol) { const worth = lamportsWorth(amount, token.decimals, usd, sol); if (worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS); }
+  throw e;
+}
 async function quoteOrNoRoute(...args: Parameters<typeof quote>) { try { return await quote(...args); } catch (e) { if (isNoRoute(e)) throw new NoRouteError(String((e as any)?.message ?? e)); throw e; } }
 
 /** Poll for confirmation instead of waiting on a WebSocket subscription; false once the blockhash expired without inclusion (then a re-send cannot double-execute). */
@@ -386,13 +402,19 @@ async function convert(conn: Connection, token: TokenConfig, cfg: EngineConfig, 
   if (!st.path) {
     let path: "direct" | "via-sol", worth: bigint | null; // what the pot would fetch, in lamports (null: Jupiter's feed has no price right now)
     try {
-      const q = await quoteOrNoRoute(token.mint, outMint, amount, cfg.slippageBps); path = "direct";
-      worth = outMint === SOL_MINT ? BigInt(q.outAmount) : await lamportsOf(conn, outMint, BigInt(q.outAmount), log);
+      try {
+        const q = await quoteOrNoRoute(token.mint, outMint, amount, cfg.slippageBps); path = "direct";
+        worth = outMint === SOL_MINT ? BigInt(q.outAmount) : await lamportsOf(conn, outMint, BigInt(q.outAmount), log);
+      } catch (e) {
+        if (!(e instanceof NoRouteError) || outMint === SOL_MINT) throw e;
+        const first = await quoteOrNoRoute(token.mint, SOL_MINT, amount, cfg.slippageBps);   // NoRouteError here: the token itself cannot be sold
+        await quoteOrNoRoute(SOL_MINT, outMint, BigInt(first.outAmount), cfg.slippageBps);    // NoRouteError here: the asset cannot be bought
+        path = "via-sol"; worth = BigInt(first.outAmount);
+      }
     } catch (e) {
-      if (!(e instanceof NoRouteError) || outMint === SOL_MINT) throw e;
-      const first = await quoteOrNoRoute(token.mint, SOL_MINT, amount, cfg.slippageBps);   // NoRouteError here: the token itself cannot be sold
-      await quoteOrNoRoute(SOL_MINT, outMint, BigInt(first.outAmount), cfg.slippageBps);    // NoRouteError here: the asset cannot be bought
-      path = "via-sol"; worth = BigInt(first.outAmount);
+      // no route at all: dust by the token's own price is kept quietly like any pot too small to swap; real money stuck alerts
+      if (e instanceof NoRouteError && !(e instanceof TooSmallError)) await dustOrRethrow(conn, token, amount, e, log);
+      throw e;
     }
     // nothing is sent yet: a pot below the floor is kept whole for the next epoch (a price the feed cannot give never blocks a swap)
     if (worth !== null && worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS);
