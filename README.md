@@ -16,7 +16,8 @@ This repository is the code the live engine runs. Every published epoch can be r
 3. **Split** what was swept across the token's sinks by their shares. A pot a sink could not pay last time stays with that
    sink and joins its next pot (`src/plan.ts`).
 4. **Convert** through Jupiter: one swap per payout asset per epoch, shared by the sinks that pay in it and split between
-   them to the unit. No route, or an amount too small to swap, keeps the pot for the next epoch.
+   them to the unit. A token still on its LaunchLab curve that Jupiter no longer routes is sold on its own curve instead, then
+   converted as usual (`curveLeg` in `src/epoch.ts`). No route, or an amount too small to swap, keeps the pot for the next epoch.
 5. **Pay**: holders by the sink's rule (`src/rules.ts`), a treasury or the creator by transfer, a burn by burning.
 6. **Publish** the epoch record and keep a resumable state file, so a run that stops halfway picks up where it left off
    and nothing is paid twice: every payment, burn and swap is written down with its signature before it is sent, and a

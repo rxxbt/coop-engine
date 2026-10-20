@@ -8,7 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import bs58 from "bs58";
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction,
   createTransferCheckedInstruction, createBurnCheckedInstruction, unpackMint, unpackAccount,
@@ -17,11 +17,11 @@ import { sinkPayoutMint, sinksAt, type EngineConfig, type TokenConfig, type Sink
 import { tokenAccounts, aggregateByOwner } from "./snapshot.js";
 import { withheldOf, harvestInstructions, mintWithheld, withdrawFromMintInstruction } from "./sweep.js";
 import { allocate, agedHolder, type Holder } from "./rules.js";
-import { NoRouteError, TooSmallError, formPots, keptBySink, runConversions, shareOf, type ConversionProgress, type ConversionState } from "./plan.js";
+import { NoRouteError, TokenNotRoutedError, TooSmallError, formPots, keptBySink, runConversions, shareOf, type ConversionProgress, type ConversionState } from "./plan.js";
 import { balanceTree, toHex } from "./merkle.js";
 import { quote, swapTransaction, jupPrices } from "./jupiter.js";
 export { jupPrices } from "./jupiter.js";
-import { LAUNCHPAD_PROGRAM, LaunchpadPool, LaunchpadVesting, getPdaLaunchpadPoolId, getPdaVestId, CREATE_CPMM_POOL_PROGRAM, CpmmPoolInfoLayout, getCpmmPdaPoolId } from "@raydium-io/raydium-sdk-v2";
+import { LAUNCHPAD_PROGRAM, LaunchpadConfig, LaunchpadPool, LaunchpadVesting, Raydium, TxVersion, getPdaLaunchpadPoolId, getPdaVestId, toBN, CREATE_CPMM_POOL_PROGRAM, CpmmPoolInfoLayout, getCpmmPdaPoolId } from "@raydium-io/raydium-sdk-v2";
 import { Ledger, type SnapshotRow } from "./ledger.js";
 import { absorbParked, nextStage, readStage, rekeyCarry, whenText, writeStage, type StageFacts } from "./stages.js";
 import { buysOf, planRefunds, signaturesSince, type Buy, type RefundEntry, type RefundRecord } from "./refunds.js";
@@ -114,7 +114,7 @@ type ConvProgress = ConversionProgress;
 type ConvState = ConversionState;
 type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink kept in the last epoch and brought along */ keptIn?: string; sigs: string[]; minAmount?: string; tokenPriceUsd?: number; swapSig?: string; quoteBefore?: string; converted?: string; noRoute?: boolean; keptWhy?: KeptWhy;
   /** Only in epochs the engine began before 2026-09-29, when every sink converted on its own: the sink's own conversion progress. */
-  path?: "direct" | "via-sol"; via?: LegState & { mint: string }; allocations?: [string, string][]; paidBatches?: number; root?: string; note?: string; carriedIn?: string; remainder?: string; kept?: string; lottery?: { slot: number; blockhash: string };
+  path?: "direct" | "via-sol" | "curve"; via?: LegState & { mint: string }; allocations?: [string, string][]; paidBatches?: number; root?: string; note?: string; carriedIn?: string; remainder?: string; kept?: string; lottery?: { slot: number; blockhash: string };
   /** The sink's payment in flight (for a holder sink: batch number `paidBatches`), persisted before it is sent and cleared in the same save
    *  that records it as paid: a resumed run settles it before building anything (since 2026-10-03). */
   pending?: Sent;
@@ -311,10 +311,80 @@ export function lamportsWorth(amount: bigint, decimals: number, tokenUsd: number
  *  too small to swap: kept, no alert. At or above the floor, or when no price can be found, real money may be stuck: the no-route
  *  error stands and alerts. */
 async function dustOrRethrow(conn: Connection, token: TokenConfig, amount: bigint, e: NoRouteError, log: (s: string) => void): Promise<never> {
+  const worth = await tokenWorth(conn, token, amount, log);
+  if (worth !== null && worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS);
+  throw e;
+}
+/** What `amount` of the token is worth in lamports at its own price (Jupiter's feed, else the curve's reserves); null when unknown. */
+async function tokenWorth(conn: Connection, token: TokenConfig, amount: bigint, log: (s: string) => void): Promise<bigint | null> {
   const usd = await tokenPriceUsd(conn, token, log).catch(() => null);
   const sol = usd ? (await jupPrices([SOL_MINT]).catch(() => ({} as Record<string, number>)))[SOL_MINT] : undefined;
-  if (usd && sol) { const worth = lamportsWorth(amount, token.decimals, usd, sol); if (worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS); }
-  throw e;
+  return usd && sol ? lamportsWorth(amount, token.decimals, usd, sol) : null;
+}
+/** Which Jupiter route converts `amount` of the token into `outMint`: one swap, or two through SOL. TokenNotRoutedError: Jupiter cannot
+ *  sell the token at all (the curve may still take it); a plain NoRouteError: the payout asset cannot be bought. `out` = what the first
+ *  quote promises (the payout asset for one swap, lamports through SOL). The quote function is a parameter so the logic can be tested. */
+export async function jupiterRoute(q: (inMint: string, outMint: string, amount: bigint, slippageBps: number) => Promise<{ outAmount: string }>, tokenMint: string, outMint: string, amount: bigint, slippageBps: number): Promise<{ path: "direct" | "via-sol"; out: bigint }> {
+  try { return { path: "direct", out: BigInt((await q(tokenMint, outMint, amount, slippageBps)).outAmount) }; }
+  catch (e) {
+    if (!(e instanceof NoRouteError)) throw e;
+    if (outMint === SOL_MINT) throw new TokenNotRoutedError(e.message);
+  }
+  let first: { outAmount: string };
+  try { first = await q(tokenMint, SOL_MINT, amount, slippageBps); }
+  catch (e) { if (e instanceof NoRouteError) throw new TokenNotRoutedError(e.message); throw e; }
+  await q(SOL_MINT, outMint, BigInt(first.outAmount), slippageBps); // NoRouteError here: the payout asset cannot be bought
+  return { path: "via-sol", out: BigInt(first.outAmount) };
+}
+/** Is the token still trading on its own LaunchLab curve (pool status 0)? A graduated token trades in its Raydium pool, which Jupiter routes. */
+async function onCurve(conn: Connection, token: TokenConfig): Promise<boolean> {
+  const info = await conn.getAccountInfo(getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, new PublicKey(token.mint), new PublicKey(token.quoteMint)).publicKey).catch(() => null);
+  return !!info && (LaunchpadPool.decode(info.data) as any).status === 0;
+}
+/** The instructions that sell `amount` of the token on its own LaunchLab curve for the pair's quote asset, built by Raydium's SDK exactly as
+ *  the token page's trade box builds a sale (src/CurveTrade.tsx in the app), with the engine's slippage; and the least the sale will deliver.
+ *  For a SOL pair the SDK uses a temporary wrapped-SOL account derived from the operator's address and closes it in the same transaction, so
+ *  the proceeds arrive as plain SOL. No extra signer is needed; one would be refused here. */
+export async function curveSale(conn: Connection, token: Pick<TokenConfig, "mint" | "quoteMint">, cfg: Pick<EngineConfig, "slippageBps">, owner: PublicKey, amount: bigint): Promise<{ ixs: TransactionInstruction[]; minOut: bigint }> {
+  const raydium = await Raydium.load({ connection: conn, owner, disableFeatureCheck: true, disableLoadToken: true, blockhashCommitment: "confirmed" });
+  const mintA = new PublicKey(token.mint), mintB = new PublicKey(token.quoteMint);
+  const poolInfo: any = await raydium.launchpad.getRpcPoolInfo({ poolId: getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mintA, mintB).publicKey });
+  const cfgAcc = await conn.getAccountInfo(poolInfo.configId);
+  if (!cfgAcc) throw new Error(`curve sale: the pool's config ${poolInfo.configId.toBase58()} is not readable`);
+  const r: any = await raydium.launchpad.sellToken({ programId: LAUNCHPAD_PROGRAM, mintA, mintB, poolInfo, configInfo: LaunchpadConfig.decode(cfgAcc.data), sellAmount: toBN(amount.toString()),
+    slippage: toBN(cfg.slippageBps), txVersion: TxVersion.LEGACY, computeBudgetConfig: { units: 400_000, microLamports: 100_000 } } as any);
+  if (r.builder?.signers?.length) throw new Error("curve sale: the SDK asked for an extra signer; refused");
+  return { ixs: r.builder.allInstructions as TransactionInstruction[], minOut: BigInt(r.extInfo.outAmount.toString()) };
+}
+/** Sell the token on its own curve, resumable and exactly once like every swap (the signature is kept before sending; a resumed run asks the
+ *  chain first). What arrived is read from the confirmed transaction. A dry run builds the sale and simulates it on-chain without sending. */
+async function curveLeg(conn: Connection, token: TokenConfig, cfg: EngineConfig, opts: RunOptions, amount: bigint, quoteMint: string, leg: LegState, sigs: string[], save: () => void, log: (s: string) => void): Promise<bigint> {
+  if (leg.converted) return BigInt(leg.converted);
+  const operatorPk = opts.operator?.publicKey ?? opts.operatorPubkey ?? PublicKey.default;
+  const settle = async (sig: string) => {
+    const got = await swapDelivered(conn, sig, operatorPk, quoteMint);
+    if (got === null) throw new Error(`curve sale ${sig} is confirmed but not readable yet; the epoch resumes on the next run`);
+    leg.converted = got.toString(); if (!sigs.includes(sig)) sigs.push(sig); save();
+    return got;
+  };
+  if (leg.swapSig && !opts.dryRun) {
+    const prev = await landed(conn, { sig: leg.swapSig, lastValidBlockHeight: leg.lastValidBlockHeight ?? 0 }, log);
+    if (prev) { const got = await settle(prev); log(`  resume: curve sale ${prev} delivered ${got}`); return got; }
+  }
+  const { ixs, minOut } = await curveSale(conn, token, cfg, operatorPk, amount);
+  log(`  sell ${amount} ${token.symbol} on its own curve for at least ${minOut} of ${quoteMint.slice(0, 6)}…`);
+  if (opts.dryRun) {
+    const { blockhash } = await conn.getLatestBlockhash("confirmed");
+    const size = new Transaction({ feePayer: operatorPk, recentBlockhash: blockhash }).add(...ixs).serialize({ requireAllSignatures: false, verifySignatures: false }).length;
+    const sim = (await conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: operatorPk, recentBlockhash: blockhash, instructions: ixs }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true })).value;
+    log(`  curve sale simulated: ${sim.err ? `REFUSED ${JSON.stringify(sim.err)}` : "accepted"}, ${sim.unitsConsumed ?? "?"} compute units, ${size} of 1232 bytes`);
+    if (sim.err) throw new Error(`curve sale simulation refused: ${JSON.stringify(sim.err)} ${(sim.logs ?? []).slice(-4).join(" | ")}`);
+    return minOut;
+  }
+  const sig = await sendOnce(conn, ixs, opts.operator!, (s) => { leg.swapSig = s.sig; leg.lastValidBlockHeight = s.lastValidBlockHeight; save(); }, log);
+  const got = await settle(sig);
+  log(`  curve sale ${sig}, delivered ${got}`);
+  return got;
 }
 async function quoteOrNoRoute(...args: Parameters<typeof quote>) { try { return await quote(...args); } catch (e) { if (isNoRoute(e)) throw new NoRouteError(String((e as any)?.message ?? e)); throw e; } }
 
@@ -400,28 +470,41 @@ async function swapLeg(conn: Connection, cfg: EngineConfig, opts: RunOptions, in
 async function convert(conn: Connection, token: TokenConfig, cfg: EngineConfig, amount: bigint, outMint: string, opts: RunOptions, st: ConvProgress, save: () => void, log: (s: string) => void): Promise<bigint> {
   if (st.converted) return BigInt(st.converted);
   if (!st.path) {
-    let path: "direct" | "via-sol", worth: bigint | null; // what the pot would fetch, in lamports (null: Jupiter's feed has no price right now)
+    let path: "direct" | "via-sol" | "curve", worth: bigint | null; // what the pot would fetch, in lamports (null: no price for it right now)
     try {
-      try {
-        const q = await quoteOrNoRoute(token.mint, outMint, amount, cfg.slippageBps); path = "direct";
-        worth = outMint === SOL_MINT ? BigInt(q.outAmount) : await lamportsOf(conn, outMint, BigInt(q.outAmount), log);
-      } catch (e) {
-        if (!(e instanceof NoRouteError) || outMint === SOL_MINT) throw e;
-        const first = await quoteOrNoRoute(token.mint, SOL_MINT, amount, cfg.slippageBps);   // NoRouteError here: the token itself cannot be sold
-        await quoteOrNoRoute(SOL_MINT, outMint, BigInt(first.outAmount), cfg.slippageBps);    // NoRouteError here: the asset cannot be bought
-        path = "via-sol"; worth = BigInt(first.outAmount);
-      }
+      const r = await jupiterRoute(quoteOrNoRoute, token.mint, outMint, amount, cfg.slippageBps);
+      path = r.path;
+      worth = r.path === "via-sol" || outMint === SOL_MINT ? r.out : await lamportsOf(conn, outMint, r.out, log);
     } catch (e) {
-      // no route at all: dust by the token's own price is kept quietly like any pot too small to swap; real money stuck alerts
-      if (e instanceof NoRouteError && !(e instanceof TooSmallError)) await dustOrRethrow(conn, token, amount, e, log);
-      throw e;
+      if (!(e instanceof NoRouteError) || e instanceof TooSmallError) throw e;
+      // Jupiter cannot sell the token (since October 2026 it drops a LaunchLab curve token about three weeks after launch). While the token
+      // still trades on its own curve its tax is sold there (since 2026-10-20): the same curve and the same fees Jupiter's route used.
+      // Anything else, or a curve that is gone: dust by the token's own price is kept quietly, real money stuck alerts.
+      if (!(e instanceof TokenNotRoutedError) || !(await onCurve(conn, token))) await dustOrRethrow(conn, token, amount, e, log);
+      worth = await tokenWorth(conn, token, amount, log);
+      if (worth !== null && worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS);
+      if (outMint !== token.quoteMint) {
+        // the second leg must exist before anything is sold: the pair's quote asset into the payout asset
+        const { decimals } = await mintProgramAndDecimals(conn, new PublicKey(token.quoteMint));
+        try { await quoteOrNoRoute(token.quoteMint, outMint, 10n ** BigInt(decimals), cfg.slippageBps); }
+        catch (e2) { if (e2 instanceof NoRouteError) await dustOrRethrow(conn, token, amount, e2, log); throw e2; }
+      }
+      path = "curve";
     }
     // nothing is sent yet: a pot below the floor is kept whole for the next epoch (a price the feed cannot give never blocks a swap)
     if (worth !== null && worth < MIN_SWAP_LAMPORTS) throw new TooSmallError(worth, MIN_SWAP_LAMPORTS);
     if (path === "via-sol") log(`  no direct route ${token.symbol} → ${outMint.slice(0, 6)}…; converting through SOL`);
+    if (path === "curve") log(`  Jupiter no longer routes ${token.symbol}; selling it on its own LaunchLab curve${outMint === token.quoteMint ? "" : `, then ${token.quoteMint.slice(0, 6)}… → ${outMint.slice(0, 6)}… through Jupiter`}`);
     st.path = path; save();
   }
   if (st.path === "direct") return swapLeg(conn, cfg, opts, token.mint, token.symbol, outMint, amount, st, st.sigs, save, log);
+  if (st.path === "curve") {
+    if (outMint === token.quoteMint) return curveLeg(conn, token, cfg, opts, amount, outMint, st, st.sigs, save, log);
+    st.via ??= { mint: token.quoteMint };
+    const got = await curveLeg(conn, token, cfg, opts, amount, token.quoteMint, st.via, st.sigs, save, log);
+    if (got === 0n) { st.converted = "0"; save(); return 0n; }
+    return swapLeg(conn, cfg, opts, token.quoteMint, "quote", outMint, got, st, st.sigs, save, log);
+  }
   st.via ??= { mint: SOL_MINT };
   const sol = await swapLeg(conn, cfg, opts, token.mint, token.symbol, SOL_MINT, amount, st.via, st.sigs, save, log);
   if (sol === 0n) { st.converted = "0"; save(); return 0n; }

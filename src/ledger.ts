@@ -22,7 +22,7 @@ export type EpochRecord = {
   /** Since 2026-09-29: one swap per payout asset per epoch. `sinks` = the sinks that shared it, `amount` = what went in (the token's base
    *  units), `converted` = what it delivered, split between those sinks by pot; `kept` = Jupiter had no route. Absent on older records,
    *  where every sink did its own swap and its signatures are among the sink's own. */
-  conversions?: { mint: string; sinks: number[]; amount: string; path?: "direct" | "via-sol"; via?: { mint: string; converted: string }; converted?: string; kept?: string; sigs: string[] }[];
+  conversions?: { mint: string; sinks: number[]; amount: string; path?: "direct" | "via-sol" | "curve"; via?: { mint: string; converted: string }; converted?: string; kept?: string; sigs: string[] }[];
   signatures: string[];
   /** `at` = the snapshot's time: holding time is measured up to it (present since 2026-09-29). */
   snapshot?: { slot: number; at?: string; holders: SnapshotRow[] };

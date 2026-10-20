@@ -66,6 +66,11 @@ export function formPots(available: bigint, shares: number[], kept: bigint[]): {
  *  and roll into the next epoch. */
 export class NoRouteError extends Error {}
 
+/** Jupiter cannot sell the token itself (no route for it at all, or the token is not tradable there), as opposed to a payout asset it cannot
+ *  buy. Since October 2026 Jupiter drops a LaunchLab curve token from routing about three weeks after launch unless its curve is deep; while
+ *  the token still trades on its own curve the engine sells there instead (src/epoch.ts `curveLeg`). */
+export class TokenNotRoutedError extends NoRouteError {}
+
 /** The pot is worth less than a swap needs (since 2026-10-02; the floor is MIN_SWAP_LAMPORTS in src/epoch.ts). Kept like a pot with no route,
  *  so it stays with its sinks and joins the next epoch's pot until it is worth a swap, but it is dust, not a missing market: no alert. */
 export class TooSmallError extends NoRouteError {
@@ -76,7 +81,7 @@ export class TooSmallError extends NoRouteError {
 /** What a conversion persists, so a crashed run resumes at the swap it died on. `path` = one direct Jupiter swap, or two swaps through SOL
  *  when Jupiter finds no direct route; decided once per epoch. `noRoute` = not converted this epoch: no route even through SOL, or, with
  *  `tooSmall` (what the pot was worth, in lamports), too small to swap. */
-export type ConversionProgress = { swapSig?: string; lastValidBlockHeight?: number; converted?: string; path?: "direct" | "via-sol"; via?: { swapSig?: string; lastValidBlockHeight?: number; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean; tooSmall?: string };
+export type ConversionProgress = { swapSig?: string; lastValidBlockHeight?: number; converted?: string; path?: "direct" | "via-sol" | "curve"; via?: { swapSig?: string; lastValidBlockHeight?: number; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean; tooSmall?: string };
 /** One swap per payout asset per epoch: `sinks` = the sinks that pay in `mint` and share the swap, `amount` = their pots together, in the
  *  token's base units. */
 export type ConversionState = ConversionProgress & { mint: string; sinks: number[]; amount: string };
