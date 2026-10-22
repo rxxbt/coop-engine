@@ -112,7 +112,7 @@ type LegState = { swapSig?: string; lastValidBlockHeight?: number; converted?: s
 /** A conversion's persisted progress, and one swap per payout asset per epoch (since 2026-09-29): see src/plan.ts. */
 type ConvProgress = ConversionProgress;
 type ConvState = ConversionState;
-type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink kept in the last epoch and brought along */ keptIn?: string; sigs: string[]; minAmount?: string; tokenPriceUsd?: number; swapSig?: string; quoteBefore?: string; converted?: string; noRoute?: boolean; keptWhy?: KeptWhy;
+type SinkState = { done: boolean; pot: string; /** the part of `pot` this sink kept in the last epoch and brought along */ keptIn?: string; /** a treasury/creator payment sent a few base units short of its part (rounding; since 2026-10-22) */ sent?: string; sigs: string[]; minAmount?: string; tokenPriceUsd?: number; swapSig?: string; quoteBefore?: string; converted?: string; noRoute?: boolean; keptWhy?: KeptWhy;
   /** Only in epochs the engine began before 2026-09-29, when every sink converted on its own: the sink's own conversion progress. */
   path?: "direct" | "via-sol" | "curve"; via?: LegState & { mint: string }; allocations?: [string, string][]; paidBatches?: number; root?: string; note?: string; carriedIn?: string; remainder?: string; kept?: string; lottery?: { slot: number; blockhash: string };
   /** The sink's payment in flight (for a holder sink: batch number `paidBatches`), persisted before it is sent and cleared in the same save
@@ -300,6 +300,24 @@ export async function sendAll(conn: Connection, ixs: TransactionInstruction[], p
 export const isStaleBlockhash = (e: unknown) => /blockhash not found/i.test(String((e as any)?.message ?? e));
 // Since 2026-10-16 Jupiter also refuses a dead curve token outright (400 TOKEN_NOT_TRADABLE, "The token … is not tradable"): nothing to swap either.
 export const isNoRoute = (e: unknown) => /no routes? found|NO_ROUTES_FOUND|could not find any route|CANNOT_COMPUTE_OTHER_AMOUNT_THRESHOLD|Cannot compute other amount threshold|TOKEN_NOT_TRADABLE|is not tradable/i.test(String((e as any)?.message ?? e));
+/** The part of the operator's balance of a token that the token's own epoch counts (pure; tested). The operator's account for a token also
+ *  holds that token for OTHER tokens that pay out in it (since 2026-10-21 a token pays its holders and treasury in the platform's own token):
+ *  bought and not paid out yet, or rounding carried to their next epoch. Such a token counts only what its epoch swept plus what its own sinks
+ *  kept last epoch, never more than the operator holds (2026-10-22: another token's treasury part waited after a failed transfer, and the
+ *  paid-in token's next epoch would have sold it as its own tax; carried rounding had already gone that way). Every other token counts the
+ *  whole balance, as before. */
+export function ownPart(balance: bigint, swept: bigint, keptLast: bigint, paidOutByOthers: boolean): bigint {
+  if (!paidOutByOthers) return balance;
+  const own = swept + keptLast;
+  return balance < own ? balance : own;
+}
+/** What a payment of `out` base units can send when the operator holds `have` (pure; tested): all of it when covered; what it holds when that
+ *  is at most `tolerance` base units short (rounding carried in from an earlier epoch that the operator no longer holds); otherwise null, and
+ *  the payment goes out as it is and fails loudly. */
+export function payable(out: bigint, have: bigint, tolerance = 10n): bigint | null {
+  if (have >= out) return out;
+  return out - have <= tolerance ? have : null;
+}
 /** What `amount` base units of a token are worth in lamports at a dollar price for the token and for SOL (pure; tested). */
 export function lamportsWorth(amount: bigint, decimals: number, tokenUsd: number, solUsd: number): bigint {
   if (!(tokenUsd > 0) || !(solUsd > 0)) return 0n;
@@ -572,8 +590,17 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
   const inAccounts = withheldRows.reduce((a, r) => a + r.withheld, 0n);
   log(`  token accounts ${rows.length}, withheld in accounts ${inAccounts} (${withheldRows.length} accts), in mint ${mintState.withheld}, tax ${mintState.feeBps} bps, authority ${mintState.withdrawAuthority}`);
   const operatorTokenAta = getAssociatedTokenAddressSync(mint, operatorPk, true, TOKEN_2022_PROGRAM_ID);
+  // what the token may count of the operator's balance (`ownPart`): all of it, unless other tokens pay out in it (since 2026-10-22)
+  const paidOutByOthers = cfg.tokens.some((u) => u.mint !== token.mint && [u.sinks, ...(u.stages ?? []).map((g) => g.sinks)].some((ss) => ss.some((s) => sinkPayoutMint(s, u) === token.mint)));
+  const keptLast = keptBySink(ledger.lastRecord(), ledger.lastRecord()?.sinks?.length ?? 0).reduce((a, b) => a + b, 0n);
+  const own = (balance: bigint, swept: bigint) => {
+    const v = ownPart(balance, swept, keptLast, paidOutByOthers);
+    if (v < balance) log(`  the operator also holds ${balance - v} ${token.symbol} for other tokens' payouts; this epoch counts ${v}`);
+    return v;
+  };
   // dry-run estimate: what a sweep would bring in plus what the operator already holds from earlier epochs (kept pots), as an execute run would see it
   let available = mintState.withheld + inAccounts + (opts.dryRun ? await tokenBalance(conn, operatorTokenAta, TOKEN_2022_PROGRAM_ID).catch(() => 0n) : 0n);
+  if (opts.dryRun) available = own(available, mintState.withheld + inAccounts);
   if (!opts.dryRun) {
     if (!opts.operator) throw new Error("operator keypair required to execute");
     if (mintState.withdrawAuthority !== operatorPk.toBase58()) throw new Error(`operator is not the withdraw authority (${mintState.withdrawAuthority})`);
@@ -603,6 +630,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       for (let i = 0; i < 12 && available < expected; i++) { await new Promise((r) => setTimeout(r, 1500)); available = await tokenBalance(conn, operatorTokenAta, TOKEN_2022_PROGRAM_ID); }
       if (expected > 0n && available === 0n) throw new Error(`swept ${expected} but the operator's balance still reads 0 after 18 s; leaving the epoch unfinished so the next run resumes here`);
       if (available < expected) log(`  note: balance ${available} is below the ${expected} swept (fees or a lagging node); using the balance`);
+      available = own(available, BigInt(state.sweep.swept ?? state.sweep.withheldBefore ?? "0"));
       state.sweep.available = available.toString(); save();
     }
   }
@@ -834,9 +862,14 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
         } else {
           // any SPL or Token-2022 asset: into the wallet's token account for it (created by the operator if missing)
           const oPk = new PublicKey(outMint); const { program, decimals } = await mintProgramAndDecimals(conn, oPk);
-          const destAta = getAssociatedTokenAddressSync(oPk, dest, true, program);
+          const destAta = getAssociatedTokenAddressSync(oPk, dest, true, program), opAta = getAssociatedTokenAddressSync(oPk, operatorPk, true, program);
+          if (!opts.dryRun) {
+            // a few base units short = rounding carried in that the operator no longer holds (since 2026-10-22): send what it holds, recorded
+            const have = await tokenBalance(conn, opAta, program), p = payable(out, have);
+            if (p !== null && p < out) { log(`  ${sink.type}: the operator holds ${have}, ${out - have} base units short of ${out} (rounding); sending ${have}`); sending = p; st.sent = p.toString(); }
+          }
           ixs.push(createAssociatedTokenAccountIdempotentInstruction(operatorPk, destAta, dest, oPk, program),
-            createTransferCheckedInstruction(getAssociatedTokenAddressSync(oPk, operatorPk, true, program), oPk, destAta, operatorPk, out, decimals, [], program));
+            createTransferCheckedInstruction(opAta, oPk, destAta, operatorPk, sending, decimals, [], program));
         }
         if (!opts.dryRun && sending > 0n) sig = await pay(st, ixs);
         log(`  ${sink.type} → ${sink.wallet} ${out} of ${asset === "quote" ? "quote" : `${outMint.slice(0, 6)}…`}`);
@@ -845,7 +878,7 @@ export async function runEpoch(cfg: EngineConfig, token: TokenConfig, opts: RunO
       // (until 2026-10-03 it was struck off before sending, and a send that failed lost it from the books)
       if (native && !opts.dryRun) { const c = loadCarry(dir); if (c[carryKey] || c[sink.wallet]) { delete c[carryKey]; delete c[sink.wallet]; saveCarry(dir, c); } }
       if (sig) st.sigs.push(sig);
-      st.pending = undefined; st.done = true; save(); records.push({ type: sink.type, wallet: sink.wallet, pot, asset, payoutMint: outMint, converted: st.converted, sigs: st.sigs }); continue;
+      st.pending = undefined; st.done = true; save(); records.push({ type: sink.type, wallet: sink.wallet, pot, asset, payoutMint: outMint, converted: st.converted, ...(st.sent ? { sent: st.sent } : {}), sigs: st.sigs }); continue;
     }
 
     // reflections (the minimum holding and the number of eligible holders were settled in step 4, before the swaps)
