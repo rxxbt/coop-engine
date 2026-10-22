@@ -78,10 +78,16 @@ export class TooSmallError extends NoRouteError {
   constructor(lamports: bigint, floor: bigint) { super(`worth ${lamports} lamports, under the ${floor} a swap needs`); this.lamports = lamports; this.floor = floor; }
 }
 
+/** One step of a "curve-buy" conversion (since 2026-10-22): a Jupiter swap, a sale on the token's own LaunchLab curve, or the purchase of the
+ *  payout asset on ITS own curve. Each step keeps its progress like a swap: the signature before sending, what arrived after. `left` = quote
+ *  a purchase did not spend because it completed the asset's curve (it stays with the operator, recorded). */
+export type ConversionLeg = { kind: "jupiter" | "sell-curve" | "buy-curve"; in: string; out: string; swapSig?: string; lastValidBlockHeight?: number; converted?: string; left?: string };
+
 /** What a conversion persists, so a crashed run resumes at the swap it died on. `path` = one direct Jupiter swap, or two swaps through SOL
- *  when Jupiter finds no direct route; decided once per epoch. `noRoute` = not converted this epoch: no route even through SOL, or, with
- *  `tooSmall` (what the pot was worth, in lamports), too small to swap. */
-export type ConversionProgress = { swapSig?: string; lastValidBlockHeight?: number; converted?: string; path?: "direct" | "via-sol" | "curve"; via?: { swapSig?: string; lastValidBlockHeight?: number; converted?: string; mint: string }; sigs: string[]; noRoute?: boolean; tooSmall?: string };
+ *  when Jupiter finds no direct route, or the token sold on its own curve ("curve"), or the payout asset bought on its own curve ("curve-buy",
+ *  its steps in `legs`); decided once per epoch. `noRoute` = not converted this epoch: no route even through SOL, or, with `tooSmall` (what
+ *  the pot was worth, in lamports), too small to swap. */
+export type ConversionProgress = { swapSig?: string; lastValidBlockHeight?: number; converted?: string; path?: "direct" | "via-sol" | "curve" | "curve-buy"; via?: { swapSig?: string; lastValidBlockHeight?: number; converted?: string; mint: string }; legs?: ConversionLeg[]; sigs: string[]; noRoute?: boolean; tooSmall?: string };
 /** One swap per payout asset per epoch: `sinks` = the sinks that pay in `mint` and share the swap, `amount` = their pots together, in the
  *  token's base units. */
 export type ConversionState = ConversionProgress & { mint: string; sinks: number[]; amount: string };
